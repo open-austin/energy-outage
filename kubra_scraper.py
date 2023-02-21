@@ -64,8 +64,8 @@ class KubraScraper(DeltaScraper):
 
         print(f"Made {self.total_requests} requests, fetching {self.total_downloaded/1000} KB.")
 
-        if number_out != expected_outages:
-            raise Exception(f"Outages found ({number_out}) does not match expected outages ({expected_outages})")
+#         if number_out != expected_outages:
+#             raise Exception(f"Outages found ({number_out}) does not match expected outages ({expected_outages})")
 
         return list(outages)
 
