@@ -1,7 +1,7 @@
 from kubra_scraper import KubraScraper
 
 
-class LGEKUScraper(KubraScraper):
+class AustinEnergyScraper(KubraScraper):
     owner = "open-austin"
     repo = "energy-outage"
     filepath = "lgeku/outages.json"
