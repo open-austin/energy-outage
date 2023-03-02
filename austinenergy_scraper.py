@@ -3,7 +3,7 @@ from kubra_scraper import KubraScraper
 
 class AustinEnergyScraper(KubraScraper):
     owner = "open-austin"
-    repo = "power-outage-data"
+    repo = "energy-outage-data"
     filepath = "outages.json"
 
     instance_id = "dd9c446f-f6b8-43f9-8f80-83f5245c60a1"
