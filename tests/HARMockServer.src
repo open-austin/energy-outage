@@ -1,5 +1,4 @@
 // TODO:
-// - Actually respond with stuff
 // - The capture we're using doesn't have any, but we could be handling 3xx?
 
 export
@@ -28,7 +27,18 @@ class HARMockServer {
     if (result != undefined) {
       return Result.from(result);
     }
-    // TODO
+
+    let hits = this.data.log.entries.filter((x) => {
+      return x.request.url == what && x.request.method == "GET"
+    });
+    if (hits.length) {
+      let [ winner ] = hits; // i.e., first one wins
+      let result = new Result(
+        winner.response.content.text, winner.response.status
+      );
+      this.cache.set(what, result);
+      return result;
+    }
 
     return new Result(null);
   }
