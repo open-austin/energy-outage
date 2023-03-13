@@ -1,0 +1,64 @@
+// TODO:
+// - Actually respond with stuff
+// - The capture we're using doesn't have any, but we could be handling 3xx?
+
+export
+class HARMockServer {
+  constructor(pathToCapturedHAR, asyncReadFileHelper) {
+    this.capturePath = pathToCapturedHAR;
+    this.$actuallyReadFileContents = asyncReadFileHelper;
+
+    this.cache = new Map();
+    this.data = null;
+  }
+
+  async read(what) {
+    const { $actuallyReadFileContents } = this;
+    if (!this.data) {
+      let result = await $actuallyReadFileContents(this.capturePath);
+      if (!result) {
+        throw Error("unreadable HAR: " + this.capturePath);
+      }
+      this.data = JSON.parse(result);
+    }
+
+    const { Result } = HARMockServer;
+
+    let result = this.cache.get(what);
+    if (result != undefined) {
+      return Result.from(result);
+    }
+    // TODO
+
+    return new Result(null);
+  }
+}
+
+HARMockServer.Result = class Result {
+  static from(other) {
+    return new Result(other.selection, other.status);
+  }
+
+  constructor(selection, status = null) {
+    if (status == null) {
+      if (selection == null) {
+        status = 404;
+      } else {
+        status = 200;
+      }
+    }
+    this.status = status;
+    this.selection = selection;
+  }
+
+  get ok() {
+    return this.status == 200;
+  }
+
+  asJSON() { // XXX needs audit/scrutiny
+    if (this.ok && this.selection) {
+      return JSON.parse(this.selection); // XXX cache this
+    }
+    throw Error("response not valid JSON");
+  }
+}

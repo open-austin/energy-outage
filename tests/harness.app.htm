@@ -1,0 +1,2627 @@
+/// <script>
+/// import { DependencySniffer } from "./DependencySniffer.js";
+/// import { InaftPathResolver } from "./InaftPathResolver.js";
+/// import { SimpleStringParser } from "./SimpleStringParser.js";
+/// import { Sourcerer } from "./Sourcerer.js";
+
+/// export
+class TestRunner {
+  constructor(systemHelper) {
+    this.config = null;
+    this.preloads = new Map();
+    this.system = systemHelper;
+
+    this._pending = [];
+
+    this.onbadconfig = null;
+    this.onfinish = null;
+    this.onpathsknown = null;
+    this.ontestexecute = null;
+    this.ontestskip = null;
+  }
+
+  runTests() {
+    return this.system.read("tests/config.json").then((text) =>
+      void this._initConfigFromText(text).then((testPaths) =>
+      void this._runNextTest(testPaths)
+    ));
+  }
+
+  _initConfigFromText(text) {
+    let testPaths, pending = [];
+    if (text) {
+      try {
+        this.config = this._validateConfig(text);
+      } catch (ex) {
+        if (ex instanceof TestRunner.ConfigError) {
+          this._dispatch(this.onbadconfig, ex);
+          return Promise.resolve([]);
+        }
+        throw ex;
+      }
+
+      let { preload, tests } = this.config;
+      if (typeof(preload) != "undefined") {
+        pending.push(this._promisePreloadText(preload));
+      }
+      if (typeof(tests) != "undefined") {
+        testPaths = tests.map((x) => this._getTestFilePath(x));
+      }
+    }
+
+    if (!testPaths) {
+      pending.push(this.system.list("tests/").then((kids) => {
+        let $ok = (x) => (!x.startsWith(".") && x.endsWith("/"));
+        testPaths = kids.filter($ok).map((x) => this._getTestFilePath(x));
+      }));
+    }
+
+    return Promise.all(pending).then(() => {
+      let stop = testPaths.indexOf(null);
+      if (stop >= 0) testPaths.splice(stop, Infinity);
+      this._dispatch(this.onpathsknown, testPaths);
+      return Promise.resolve(testPaths);
+    }).catch((err) => {
+      if (err instanceof TestRunner.ConfigError) {
+        this._dispatch(this.onbadconfig, err);
+        return Promise.resolve([]);
+      } else {
+        Promise.reject(err); // Unknown/unexpected
+      }
+    });
+  }
+
+  _dispatch(handler, ...args) {
+    if (handler) handler.apply(null, args);
+  }
+
+  _getTestFilePath(directoryName) {
+    if (!directoryName) return null;
+    if (!directoryName.endsWith("/")) {
+      directoryName += "/";
+    }
+    return "tests/" + directoryName + "index.js";
+  }
+
+  _validateConfig(text) {
+    // TODO Actually validate this (e.g., de-dupe entries)
+    try {
+      var config = JSON.parse(text);
+    } catch (ex) {
+      const { PARSE_ISSUE } = TestRunner.ConfigError;
+      throw new TestRunner.ConfigError(PARSE_ISSUE, ex);
+    }
+    return config;
+  }
+
+  _promisePreloadText(paths) {
+    let blockers = [];
+    for (let i = 0; i < paths.length; ++i) {
+      blockers.push(
+        this.system.read(paths[i]).then((contents) => {
+          if (contents != null) {
+            this.preloads.set(paths[i], { path: paths[i], text: contents });
+            return Promise.resolve();
+          } else {
+            const { PRELOAD_ISSUE } = TestRunner.ConfigError;
+            let inner = new Error("No such file: " + paths[i]);
+            return Promise.reject(
+              new TestRunner.ConfigError(PRELOAD_ISSUE, inner)
+            );
+          }
+        })
+      );
+    }
+    return Promise.all(blockers);
+  }
+
+  _runNextTest(testPaths, index = 0) {
+    let path = testPaths[index];
+    if (path) {
+      this._pending.push(new Promise((end) => {
+        this.system.createContext().then((context) =>
+          void this._promiseEvalPreloads(context).then(() =>
+          void this._evalTestScript(context, path).then(() =>
+          void (end(), this._runNextTest(testPaths, index + 1))
+        )));
+      }));
+    } else {
+      Promise.all(this._pending).then(() => {
+        this._dispatch(this.onfinish);
+      });
+    }
+  }
+
+  _promiseEvalPreloads(context) {
+    if (!this.preloads.size) return Promise.resolve();
+    let specs = this.config.preload;
+    let blockers = [];
+    for (let i = 0; i < specs.length; ++i) {
+      let { path, text } = this.preloads.get(specs[i]);
+      blockers.push(
+        this._rewriteImports(context, text, path).then((phonyText) =>
+          this.system.loadScript(context, path, phonyText)
+        )
+      );
+    }
+    return Promise.all(blockers);
+  }
+
+  _evalTestScript(rootContext, path) {
+    const timeBudget = 2500;
+    var end; // can (will) manage contention for `onfinish` dispatch
+    this._pending.push(new Promise((resolve) => void(end = resolve)));
+    return this.system.read(path).then((scriptText) => {
+      if (scriptText) {
+        this.system.createContext(rootContext, true).then((subContext) =>
+          void this._rewriteImports(subContext, scriptText).then((phonyText) =>
+          void this.system.startCountdown(subContext, timeBudget).then(() =>
+          void this.system.loadScript(subContext, path, phonyText).then(() =>
+          void (end(), this._dispatch(this.ontestexecute, rootContext, path))
+        ))))
+      } else {
+        end(), this._dispatch(this.ontestskip, path);
+      }
+    });
+  }
+
+  _rewriteImports(context, text, basePath = null) {
+    let sniffer = new DependencySniffer(text);
+    let imports = sniffer.getImports();
+
+    let blockers = [];
+    let nextContext = context.parent || context;
+    for (let i = 0, n = imports.length; i < n; ++i) {
+      let relativePath = SimpleStringParser.eval(imports[i].specifier);
+      let dep = context.pathResolver.handle(relativePath, basePath);
+      if (dep != InaftPathResolver.HELPER_PATH) {
+        blockers.push(
+          this.system.read(dep).then((text) => {
+            if (text != null) return (
+              this._rewriteImports(nextContext, text, dep).then((fake) => {
+                return this.system.loadScript(nextContext, dep, fake);
+              })
+            );
+          }
+        ));
+      }
+    }
+
+    return Promise.all(blockers).then(() => {
+      return Promise.resolve(
+        Sourcerer.rewrite(text, imports, sniffer.getExports())
+      );
+    });
+  }
+}
+
+TestRunner.ConfigError = class ConfigError extends Error {
+  constructor(message, inner) {
+    super(message);
+    this.innerException = inner;
+  }
+}
+
+TestRunner.ConfigError.PARSE_ISSUE = "Couldn't parse tests' config.json";
+TestRunner.ConfigError.PRELOAD_ISSUE = "Couldn't preload file";
+/// </script>
+/// <script>
+/// export
+class SimpleScanner {
+  constructor(text) {
+    this.text = text;
+    this.position = 0;
+  }
+
+  get tip() {
+    let unit = this.text.codePointAt(this.position);
+    if (unit == undefined) return "";
+    return String.fromCodePoint(unit);
+  }
+
+  getGenericToken() {
+    if (this.tip == "") return null; // EOF
+    let result = { position: this.position };
+    if (this.isWhitespace(this.tip)) {
+      result.content = "";
+      do {
+        result.content += this.readCodePoint();
+      } while (this.isWhitespace(this.tip));
+      result.type = SimpleScanner.WHITESPACE;
+    } else {
+      result.type = SimpleScanner.UNKNOWN;
+    }
+    return result;
+  }
+
+  readCodePoint() {
+    let result = this.tip;
+    this.position += result.length;
+    return result;
+  }
+
+  isWhitespace(x) {
+    return (x == " " || x == "\t" || x == "\r" || x == "\n");
+  }
+}
+
+SimpleScanner.UNKNOWN = -1;
+SimpleScanner.WHITESPACE = 0;
+/// </script>
+/// <script>
+/// import { SimpleScanner } from "./SimpleScanner.js";
+/// import { SimpleStringParser } from "./SimpleStringParser.js";
+
+/// export
+class DependencySniffer extends SimpleScanner {
+  constructor(text, preserveWhitespace) {
+    super(text);
+    this._findings = null;
+    this._preserveWhitespace = !!preserveWhitespace;
+  }
+
+  getImports() {
+    if (!this._findings) this._findings = this._sniff();
+    return this._findings.imports;
+  }
+
+  getExports() {
+    if (!this._findings) this._findings = this._sniff();
+    return this._findings.exports;
+  }
+
+  getToken(includeGaps = this._preserveWhitespace) {
+    const { WHITESPACE, UNKNOWN } = SimpleScanner;
+    do {
+      var result = this.getGenericToken();
+    } while (result && result.type == WHITESPACE && !includeGaps);
+    if (result && result.type == UNKNOWN) {
+      switch (this.tip) {
+        case ";":
+          result.type = DependencySniffer.SEMICOLON;
+          result.content = this.readCodePoint();
+        break;
+        case ",":
+          result.type = DependencySniffer.COMMA;
+          result.content = this.readCodePoint();
+        break;
+        case "{":
+          result.type = DependencySniffer.OPENED_CURLY;
+          result.content = this.readCodePoint();
+        break;
+        case "}":
+          result.type = DependencySniffer.CLOSED_CURLY;
+          result.content = this.readCodePoint();
+        break;
+        case "*":
+          result.type = DependencySniffer.ASTERISK;
+          result.content = this.readCodePoint();
+        break;
+        case "'":
+        case '"':
+          result.content = this._scanString();
+          result.type = DependencySniffer.STRING;
+        break;
+        default:
+          if (this.tip == "$" || this.tip == "_" ||
+              this._isLetter(this.tip)) {
+            result.content = this._scanWord();
+            switch (result.content) {
+              case "export":
+                result.type = DependencySniffer.EXPORT;
+              break;
+              case "from":
+                result.type = DependencySniffer.FROM;
+              break;
+              case "import":
+                result.type = DependencySniffer.IMPORT;
+              break;
+              default:
+                result.type = DependencySniffer.WORD;
+              break;
+            }
+          } else {
+            // Still UNKNOWN, but we need to advance.
+            result.content = this.readCodePoint();
+          }
+        break;
+      }
+    }
+    return result;
+  }
+
+  _scanString() {
+    const offset = this.position;
+    // NB: This relies on the parser's implementation details.
+    let parser = new SimpleStringParser({
+      codePointAt: (index) => (!parser.literal) ?
+        this.text.codePointAt(offset + index) :
+        undefined
+    });
+    let { literal } = parser.run();
+    this.position += literal.length;
+    return literal;
+  }
+
+  _scanWholeLine() {
+    while (this.tip != "\n" && this.tip != "") {
+      this.readCodePoint();
+    }
+  }
+
+  _scanWord() {
+    let result = this.readCodePoint();
+    while (this._isLetter(this.tip) || this._isDigit(this.tip) ||
+           this.tip == "$" || this.tip == "_") {
+      result += this.readCodePoint();
+    }
+    return result;
+  }
+
+  _isLetter(x) {
+    return ("A" <= x && x <= "Z") || ("a" <= x && x <= "z");
+  }
+
+  _isDigit(x) {
+    return ("0" <= x && x <= "9");
+  }
+
+  _sniff() {
+    if (this.position != 0) throw new Error("Re-entrant parse disallowed");
+    let result = { imports: [], exports: [] };
+    let token = this.getToken();
+    if (token) {
+      do {
+        if (token.type == DependencySniffer.IMPORT) {
+          result.imports.push(this._parseImportDeclaration(token));
+        } else if (token.type == DependencySniffer.EXPORT) {
+          result.exports.push(this._parseExportDeclaration(token));
+        } else {
+          this._scanWholeLine();
+        }
+        token = this.getToken();
+      } while (token);
+    }
+    return result;
+  }
+
+  _parseImportDeclaration(token) {
+    let start = token.position;
+    let specifier, list = [];
+    token = this._expectToken(this.getToken());
+    if (token.type != DependencySniffer.OPENED_CURLY) {
+      throw new Error("Only explicitly named imports supported");
+    }
+    token = this._expectToken(this.getToken());
+    if (token.type == DependencySniffer.ASTERISK) {
+      throw new Error("Wildcard imports not supported");
+    }
+    list.push(this._expectToken(token, DependencySniffer.WORD).content);
+    token = this._expectToken(this.getToken());
+    while (token.type != DependencySniffer.CLOSED_CURLY) {
+      if (token.type == DependencySniffer.WORD && token.content == "as") {
+        throw new Error("Namespace rebinding for imports not supported");
+      }
+      this._expectToken(token, DependencySniffer.COMMA);
+      let word = this._expectToken(this.getToken(), DependencySniffer.WORD);
+      list.push(word.content);
+      token = this._expectToken(this.getToken());
+    }
+    this._expectToken(token, DependencySniffer.CLOSED_CURLY);
+    token = this._expectToken(this.getToken(), DependencySniffer.FROM);
+    token = this._expectToken(this.getToken(), DependencySniffer.STRING);
+    specifier = token.content;
+    if (this.tip && this.tip != "\n") {
+      token = this._expectToken(this.getToken(), DependencySniffer.SEMICOLON);
+    }
+    let end = token.position + token.content.length;
+    return { list: list, specifier: specifier, span: [ start, end ] };
+  }
+
+  _parseExportDeclaration(token) {
+    let start = token.position;
+    let mark = this.position;
+    token = this._expectToken(this.getToken(), DependencySniffer.WORD);
+    let kind = token.content;
+    if (kind != "class" && kind != "function" && kind != "const" &&
+        kind != "var" && kind != "let") {
+      throw new Error("Unsupported export: " + JSON.stringify(kind));
+    }
+    token = this._expectToken(this.getToken(), DependencySniffer.WORD);
+    let name = token.content;
+    let end = token.position + token.content.length;
+    return { kind: kind, name: name, span: [ start, end ], mark: mark };
+  }
+
+  _expectToken(token, type) {
+    if (token == null) throw new Error("Unexpected EOF");
+    if (typeof(type) != "undefined" && token.type != type) {
+      throw new Error("Unexpected token: " + JSON.stringify(token.content));
+    }
+    return token;
+  }
+}
+
+DependencySniffer.WORD = 1;
+DependencySniffer.SEMICOLON= 2;
+DependencySniffer.COMMA = 3;
+DependencySniffer.OPENED_CURLY = 4;
+DependencySniffer.CLOSED_CURLY = 5;
+DependencySniffer.ASTERISK = 6;
+DependencySniffer.STRING = 9;
+DependencySniffer.IMPORT = 11;
+DependencySniffer.FROM = 12;
+DependencySniffer.EXPORT = 21;
+/// </script>
+/// <script>
+/// import { SimpleScanner } from "./SimpleScanner.js";
+
+/// export
+class SimpleStringParser {
+  constructor(input) {
+    this._scanner = new SimpleScanner(input);
+    this.literal = null;
+    this.value = null;
+  }
+
+  static eval(input) {
+    let parser = new SimpleStringParser(input);
+    parser.run();
+    return parser.value;
+  }
+
+  run() {
+    let quote = this._scanner.readCodePoint();
+    let isEscaped = false;
+    let result = quote;
+    let jsonSafe = "";
+    while (!(this._scanner.tip == quote && !isEscaped)) {
+      if (this._scanner.tip == "") throw new Error("Unexpected EOF");
+      if (quote == "'") {
+        if (this._scanner.tip == "\"" && !isEscaped) {
+          jsonSafe += "\\";
+        } else if (this._scanner.tip == "'" && isEscaped) {
+          jsonSafe = jsonSafe.substring(0, jsonSafe.length - 1);
+        }
+      }
+      if (!isEscaped) {
+        if (this._scanner.tip == "\u2028" || this._scanner.tip == "\u2029") {
+          throw new Error("Unterminated string literal");
+        }
+        if (this._scanner.tip == "\\") isEscaped = true;
+      } else {
+        isEscaped = false;
+      }
+      jsonSafe += this._scanner.tip;
+      result += this._scanner.readCodePoint();
+    }
+    result += this._scanner.readCodePoint();
+    this.value = JSON.parse("\"" + jsonSafe + "\"");
+    this.literal = result;
+    if (this._scanner.tip) throw new Error(
+      "Unexpected token " + this._scanner.tip + " after string literal"
+    );
+    return this;
+  }
+}
+/// </script>
+/// <script>
+/// export
+class InaftPathResolver {
+  constructor(withMagic = false) {
+    this.isMagic = withMagic;
+  }
+
+  static normalizePath(path, reference = "") {
+    if (!InaftPathResolver.isRelative(path)) return path;
+    let normalized = [];
+    let parts = reference.split("/");
+    parts.pop();
+    parts = parts.concat(path.split("/"));
+    for (let i = 0; i < parts.length; ++i) {
+      switch (parts[i]) {
+        case ".":
+          // no-op
+        break;
+        case "..":
+          let popped = normalized.pop();
+          if (popped == undefined) throw new Error(
+            "Path forays outside local root: " + JSON.stringify(path) + " " +
+            "(relative to " + JSON.stringify(reference) + ")"
+          );
+        break;
+        default:
+          normalized.push(parts[i]);
+        break;
+      }
+    }
+    return normalized.join("/");
+  }
+
+  static isRelative(path) {
+    return path.substr(0, 2) == "./" || path.substr(0, 3) == "../";
+  }
+
+  static getRealNameForMagicPath(id) {
+    let magic = "$";
+    if (!id.startsWith(magic)) return null;
+    for (let i = magic.length; i < id.length;) {
+      let codePoint = String.fromCodePoint(id.codePointAt(i));
+      if (codePoint == "/") break;
+      magic += codePoint;
+      if (codePoint != "_") {
+        if (codePoint < "A") return null;
+        if (codePoint > "Z") return null;
+      }
+      i += codePoint.length;
+    }
+
+    switch (magic) {
+      case InaftPathResolver.HELPER_PATH:
+        return id;
+      case InaftPathResolver.PROJECT_DIR:
+        return id.substr((InaftPathResolver.PROJECT_DIR + "/").length);
+    }
+
+    return null;
+  }
+
+  handle(path, relativeTo) {
+    if (this.isMagic) {
+      return InaftPathResolver.getRealNameForMagicPath(path);
+    }
+    return InaftPathResolver.normalizePath(path, relativeTo);
+  }
+}
+
+InaftPathResolver.WITH_MAGIC = true;
+
+InaftPathResolver.HELPER_PATH = "$TEST_HELPER";
+InaftPathResolver.PROJECT_DIR = "$PROJECT";
+/// </script>
+/// <script>
+/// import { TextSplicer } from "./TextSplicer.js";
+/// import { TripleScanner } from "./TripleScanner.js";
+
+/// export
+class Sourcerer {
+  constructor(text) {
+    this._text = text;
+  }
+
+  static makeDataURI(text, contentType = "text/plain") {
+    return "data:" + contentType + ";base64," + btoa(text);
+  }
+
+  static makeIIFE(source, argumentName = "", argumentValue = "") {
+    let fn = new Function(argumentName, source);
+    return "(" + fn.toString() + ")(" + argumentValue + ");\n";
+  }
+
+  static rewrite(text, imports, exports) {
+    let result = new TextSplicer(text);
+    let trailer = "";
+
+    let $itransform = (importInfo) => {
+      let { list, specifier } = importInfo;
+      let result = "var { " + list.join(", ") + " } = " +
+        "require(" + specifier + ");";
+      let [ start, end ] = importInfo.span;
+      let lineCount = text.substring(start, end).split(/\r\n|\n|\r/).length;
+      while (lineCount > 1) {
+        result += "\n";
+        --lineCount;
+      }
+      return result;
+    };
+
+    for (let i = 0, n = imports.length; i < n; ++i) {
+      let [ start, end ] = imports[i].span;
+      result.splice(start, end, $itransform(imports[i]));
+    }
+
+    let $etransform = (exportInfo) => {
+      let { name } = exportInfo;
+      trailer += "\nexports." + name + " = " + name + ";"; // XXX do better
+      return "/** @exports */";
+    };
+
+    for (let i = 0, n = exports.length; i < n; ++i) {
+      let [ start ] = exports[i].span, end = exports[i].mark;
+      result.splice(start, end, $etransform(exports[i]));
+    }
+
+    return String(result) + trailer;
+  }
+
+  extractClassDefinition(constructor) {
+    let scanner = new TripleScanner(this._text);
+    var current = scanner.getNextToken();
+    while (current != null) {
+      if (current.type == TripleScanner.DELIMITER_OPEN) {
+        let source = "";
+        current = scanner.getNextToken();
+        // assert(current.type == TripleScanner.WHITESPACE)
+        current = scanner.getNextToken();
+        // assert(current.type == TripleScanner.TEXT)
+        while (current.content.startsWith("///")) {
+          while (scanner.tip == "\n") {
+            scanner.readCodePoint();
+          }
+          current = scanner.getNextToken();
+        }
+        if (current.content != "class") {
+          continue;
+        }
+        source += current.content;
+        current = scanner.getNextToken();
+        // assert(current.type == TripleScanner.WHITESPACE)
+        source += current.content;
+        current = scanner.getNextToken();
+        if (current.content != constructor.name) {
+          continue;
+        }
+        do {
+          if (current == null) throw new Error("Unexpected EOF");
+          source += current.content;
+          current = scanner.getNextToken();
+        } while (current.type != TripleScanner.DELIMITER_CLOSE);
+        return source;
+      }
+      current = scanner.getNextToken();
+    }
+    throw new Error("Class not found: " + constructor.name);
+  }
+}
+/// </script>
+/// <script>
+/// export
+class TextSplicer {
+  constructor(text) {
+    this._source = text;
+    this._splices = [];
+  }
+
+  splice(start, end, contents) {
+    this._splices.push(new TextSplicer.Splice(start, end, contents));
+  }
+
+  toString() {
+    this._splices = this._splices.sort((a, b) => (a.start - b.start));
+
+    let parts = [];
+    // NB: `prefaceMark` and `end` may end up with value `undefined` in a few
+    // different cases.  It's okay; `substring` will still work how we want.
+    for (let i = 0, n = this._splices.length; i < n; ++i) {
+      let prefaceMark = end;
+      var { start, end } = this._splices[i];
+      if (start < prefaceMark) throw new Error("Overlapping splices");
+      parts.push(this._source.substring(prefaceMark, start));
+      parts.push(this._splices[i].contents);
+    }
+    parts.push(this._source.substring(end));
+
+    return parts.join("");
+  }
+}
+
+TextSplicer.Splice = class Splice {
+  constructor(start, end, contents) {
+    this.start = start;
+    this.end = end;
+    this.contents = contents;
+  }
+}
+/// </script>
+/// <script>
+/// import { SimpleScanner } from "./SimpleScanner.js";
+
+/// export
+class TripleScanner extends SimpleScanner {
+  getNextToken() {
+    let result = this.getGenericToken();
+    if (result && result.type == SimpleScanner.UNKNOWN) {
+      result.content = this._scanText();
+      if (result.content == "/// \x3Cscript\x3E" ||
+          result.content == "// \x3Cscript\x3E") {
+        result.type = TripleScanner.DELIMITER_OPEN;
+      } else if (result.content == "/// \x3C/script\x3E" ||
+                 result.content == "// \x3C/script\x3E") {
+        result.type = TripleScanner.DELIMITER_CLOSE;
+      } else {
+        result.type = TripleScanner.TEXT;
+      }
+    }
+    return result;
+  }
+
+  _scanText() {
+    let result = "";
+    while (this.tip && !this.isWhitespace(this.tip)) {
+      result += this.readCodePoint();
+    }
+    if (result.startsWith("//")) {
+      while (this.tip && this.tip != "\n") {
+        result += this.readCodePoint();
+      }
+    }
+    return result;
+  }
+}
+
+TripleScanner.WHITESPACE = SimpleScanner.WHITESPACE;
+TripleScanner.TEXT = 1;
+TripleScanner.DELIMITER_OPEN = 2;
+TripleScanner.DELIMITER_CLOSE = 3;
+/// </script>
+/// <script>
+/// import { BrowserWorkerHandler } from "./BrowserWorkerHandler.js";
+/// import { BrowserQuirksHack } from "./BrowserQuirksHack.js";
+/// import { BrowserUI } from "./BrowserUI.js";
+/// import { ExecutionContext } from "./ExecutionContext.js";
+/// import { FileCache } from "./FileCache.js";
+/// import { FileUtils } from "./FileUtils.js";
+/// import { Sourcerer } from "./Sourcerer.js";
+/// import { System } from "./System.js";
+/// import { TestMediator } from "./TestMediator.js";
+/// import { TestRunner } from "./TestRunner.js";
+/// import { WebkitFileIngester } from "./WebkitFileIngester.js";
+/// import { credits } from "./credits.js";
+
+/// export
+function BrowserHandler() {
+  if (typeof(window) == "undefined") {
+    throw new System.ShuntingError("not a browser environment");
+  }
+
+  this._quirksHack = new BrowserQuirksHack(window);
+
+  this._location = window.location;
+  this._domRoot = window.document;
+  this._workOrders = new Map();
+
+  this._ui = null;
+  this._uiMediator = null;
+
+  this._directoryInput = null;
+  this._fileSource = null;
+
+  this._contextToWorkerMap = new WeakMap();
+
+  let scriptSourceCode = this._blankPage();
+  this._sourcerer = new Sourcerer(scriptSourceCode);
+  this._workerURI = BrowserWorkerHandler.getWorkerURI(this._sourcerer);
+}
+
+{
+  let $proto = BrowserHandler.prototype;
+
+  $proto._blankPage = function() {
+    try {
+      return this._domRoot.body.innerHTML;
+    } finally {
+      this._domRoot.body.textContent = "";
+    }
+  }
+
+  $proto.run = function() {
+    this._domRoot.defaultView.onload = () => {
+      if (this._quirksHack.wrap()) return;
+
+      this._ui = new BrowserUI(this, this._domRoot.body);
+
+      this._domRoot.defaultView.addEventListener("message", this);
+
+      this._directoryInput = this._domRoot.createElement("input");
+      this._directoryInput.setAttribute("type", "file");
+      this._directoryInput.setAttribute("webkitdirectory", "true");
+      this._domRoot.head.appendChild(this._directoryInput);
+
+      this._directoryInput.onchange = this._onDirectoryChange.bind(this);
+    }
+  }
+
+  // NB: internal use only (for UI; not part of the abstract system interface)
+  $proto.getFiles = function() {
+    this._directoryInput.click();
+  }
+
+  $proto._onDirectoryChange = function(event) {
+    this._ui.acknowledgeTests(null);
+    this._fileSource = WebkitFileIngester.cache(event.target.files);
+    let harness = new TestRunner(this);
+    harness.onbadconfig = this._ui.showConfigProblem.bind(this._ui);
+    harness.onpathsknown = this._ui.acknowledgeTests.bind(this._ui);
+    harness.ontestskip = this._ui.markTestAsSkipped.bind(this._ui);
+    harness.ontestexecute = this._getResults.bind(this);
+    harness.runTests();
+  }
+
+  $proto.createContext = function(parent, wantMagic = false) {
+    let context = new ExecutionContext(parent, wantMagic);
+    if (!parent) {
+      let worker = new Worker(this._workerURI);
+      worker.addEventListener("message", this);
+      this._contextToWorkerMap.set(context, worker);
+    }
+    return Promise.resolve(context);
+  }
+
+  $proto.startCountdown = function(context, millis) {
+    let message = new TestMediator.StartCountdownWorkerMessage(millis);
+    let rootContext = ExecutionContext.getRoot(context);
+    let worker = this._contextToWorkerMap.get(rootContext);
+    worker.postMessage(message.toString());
+    return Promise.resolve(); // XXX fire-and-forget is okay here, right?
+  }
+
+  $proto.loadScript = function(context, fileName, contents) {
+    return new Promise((resolve) => {
+      let message = new TestMediator.EvalScriptWorkerMessage(
+        fileName, contents, context.isMagic, this._workOrders
+      );
+      this._workOrders.set(message.id, {
+        resolve: resolve,
+        context: context,
+        path: fileName
+      });
+      let rootContext = ExecutionContext.getRoot(context);
+      let worker = this._contextToWorkerMap.get(rootContext);
+      worker.postMessage(message.toString());
+    });
+  }
+
+  $proto.handleEvent = function(event) {
+    switch (event.type) {
+      case "message": return void(this._onMessage(event));
+      default: throw new Error("Unexpected event: " + event.type);
+    }
+  }
+
+  $proto._onMessage = function(event) {
+    try {
+      var payload = JSON.parse(event.data);
+      if (!("type" in payload)) return;
+    } catch (ex) { }
+
+    switch (payload.type) {
+      case TestMediator.RESOLVE_EVAL:
+        return void(this._onResolveEval(payload));
+      case TestMediator.REVIEW_RESULTS:
+        return void(this._onResultsReady(payload));
+      case TestMediator.READ_FILE:
+        return void(this._onFileReadRequest(payload, event.target));
+    }
+  }
+
+  $proto._pullOrder = function(id) {
+    let result = this._workOrders.get(id);
+    this._workOrders.delete(id);
+    return result;
+  }
+
+  $proto._onResolveEval = function(message) {
+    let order = this._pullOrder(message.ref);
+    if (message.error != null) {
+      let { context, path } = order;
+      let { error, stack } = message;
+      let exception = new BrowserHandler.Exception(path, error, stack);
+      let rootContext = ExecutionContext.getRoot(context);
+      rootContext.recordException(path, exception);
+    }
+    order.resolve();
+  }
+
+  $proto._getResults = function(context, path) {
+    const { RequestResultsWorkerMessage } = TestMediator;
+    let message = new RequestResultsWorkerMessage(this._workOrders);
+    let rootContext = ExecutionContext.getRoot(context);
+    this._workOrders.set(message.id, { path: path, context: rootContext });
+    let worker = this._contextToWorkerMap.get(rootContext);
+    worker.postMessage(message.toString());
+  }
+
+  $proto._onResultsReady = function(message) {
+    let order = this._pullOrder(message.ref);
+    message.value.metafailures = this._getMetafailures(order.context);
+    this._ui.showResults(order.path, message.value);
+  }
+
+  $proto._getMetafailures = function(context) {
+    let lists = Array.from(context.exceptions.values());
+    return lists.reduce((all, some) => all.concat(some), []);
+  }
+
+  $proto._onFileReadRequest = function(payload, worker) {
+    const { ResolveReadWorkerMessage } = TestMediator;
+    this.read(payload.value, payload.raw).then((contents) => {
+      if (payload.raw) {
+        contents = Array.from(new Uint8Array(contents));
+      }
+      let response = new ResolveReadWorkerMessage(contents, payload.id);
+      worker.postMessage(String(response));
+    });
+  }
+
+  $proto.read = function(path, raw) {
+    let file = this._fileSource.recall(path);
+    return WebkitFileIngester.readBlob(file, raw);
+  }
+
+  $proto.list = function(path) {
+    let kids = FileUtils.list(this._fileSource, path);
+    return Promise.resolve(kids);
+  }
+}
+
+BrowserHandler.Exception = class Exception {
+  constructor(path, message, stack) {
+    // NB: Instances MUST remain stringify-able.
+    this.path = path;
+    this.message = message;
+    this.stack = stack;
+  }
+}
+/// </script>
+/// <script>
+/// import { ExecutionContext } from "./ExecutionContext.js";
+/// import { InaftPathResolver } from "./InaftPathResolver.js";
+/// import { InaftTestHelper } from "./InaftTestHelper.js";
+/// import { Loader } from "./Loader.js";
+/// import { Require } from "./Require.js";
+/// import { Sourcerer } from "./Sourcerer.js";
+
+/// export
+class BrowserWorkerHandler {
+  constructor(worker) {
+    this._worker = worker;
+    this._workOrders = new Map();
+    this._rootContext = ExecutionContext.createRoot(this);
+  }
+
+  static getWorkerURI(sourcerer) {
+    return Sourcerer.makeDataURI(
+      Sourcerer.makeIIFE(
+        sourcerer.extractClassDefinition(ExecutionContext) + "\n" +
+        sourcerer.extractClassDefinition(ExecutionTimeout) + "\n" +
+        sourcerer.extractClassDefinition(InaftPathResolver) + "\n" +
+        sourcerer.extractClassDefinition(InaftTestHelper) + "\n" +
+        sourcerer.extractClassDefinition(Loader) + "\n" +
+        sourcerer.extractClassDefinition(Require) + "\n" +
+        sourcerer.extractClassDefinition(TestMediator) + "\n" +
+        sourcerer.extractClassDefinition(BrowserWorkerHandler) + "\n" +
+        "BrowserWorkerHandler.install(worker);",
+        "worker", "this"
+      )
+    );
+  }
+
+  static install(worker) {
+    let handler = new BrowserWorkerHandler(worker);
+    worker.addEventListener("message", handler);
+  }
+
+  read(path, raw) {
+    return new Promise((resolve) => {
+      const { ReadFileWorkerMessage } = TestMediator;
+      let message = new ReadFileWorkerMessage(path, raw, this._workOrders);
+      this._workOrders.set(message.id, { resolve: resolve, raw: raw });
+      this._worker.postMessage(String(message));
+    });
+  }
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "message": return void(this._onMessage(event));
+      default: throw new Error("Unexpected event: " + event.type);
+    }
+  }
+
+  _onMessage(event) {
+    try {
+      var payload = JSON.parse(event.data);
+      if (!("type" in payload)) return;
+    } catch (ex) { }
+
+    switch (payload.type) {
+      case TestMediator.EVAL_SCRIPT:
+        return void(this._onEvalScriptRequest(payload, event.target));
+      case TestMediator.REQUEST_RESULTS:
+        return void(this._onTestResultsRequested(payload, event.target));
+      case TestMediator.RESOLVE_READ:
+        return void(this._onResolveRead(payload));
+      case TestMediator.START_COUNTDOWN:
+        return void(this._onStartCountdown(payload));
+    }
+  }
+
+  _onEvalScriptRequest(message, target) {
+    const { ResolveEvalWorkerMessage } = TestMediator;
+    const { name, value, magic } = message;
+    let context = new ExecutionContext(this._rootContext, magic);
+    let exception = ExecutionContext.evaluate(context, name, value);
+    if (exception) {
+      var error = exception.name + ": " + exception.message;
+      var stack = exception.stack;
+    }
+    let response = new ResolveEvalWorkerMessage(message.id, error, stack);
+    target.postMessage(response.toString());
+  }
+
+  _onTestResultsRequested(message, target) {
+    const { ReviewResultsWorkerMessage } = TestMediator;
+    ExecutionContext.preemptTimerIfDone(this._rootContext);
+    return this._rootContext.getTestResults().then((results) => {
+      let response = new ReviewResultsWorkerMessage(results, message.id);
+      target.postMessage(response.toString());
+    });
+  }
+
+  _onResolveRead(message) {
+    let order = this._workOrders.get(message.ref);
+    if (!order) throw new Error("Unexpected response: " + message);
+    this._workOrders.delete(message.ref);
+    if (order.raw) {
+      order.resolve(Uint8Array.from(message.value));
+    } else {
+      order.resolve(message.value);
+    }
+  }
+
+  _onStartCountdown(message) {
+    ExecutionContext.setUpTimer(this._rootContext, ($finish) => {
+      let ref = this._worker.setTimeout($finish, message.value);
+      return () => void(this._worker.clearTimeout(ref));
+    });
+  }
+}
+/// </script>
+/// <script>
+/// import { ExecutionTimeout } from "./ExecutionTimeout.js";
+/// import { InaftPathResolver } from "./InaftPathResolver.js";
+/// import { InaftTestHelper } from "./InaftTestHelper.js";
+/// import { Loader } from "./Loader.js";
+
+/// export
+class ExecutionContext {
+  constructor(parent, isMagic, loader = null) {
+    this.parent = parent;
+    this.isMagic = isMagic;
+    this.loader = loader;
+    this.pathResolver = new InaftPathResolver(isMagic);
+    if (parent) {
+      if (loader) throw new Error("Non-root execution context");
+      this.exceptions = null;
+    } else {
+      this.exceptions = new Map();
+    }
+    this.timer = null;
+  }
+
+  static createRoot(system, withMagic = false, loader = new Loader()) {
+    let result = new ExecutionContext(null, withMagic, loader);
+    result.timer = new ExecutionTimeout();
+
+    let helperModule = Loader.createModule(InaftPathResolver.HELPER_PATH);
+    helperModule.exports = new InaftTestHelper(system, result.timer);
+    loader.cacheModule(helperModule);
+
+    return result;
+  }
+
+  static setUpTimer(context, $init) {
+    let rootContext = ExecutionContext.getRoot(context);
+    ++rootContext.timer.contention;
+    rootContext.timer.start($init)
+    return Promise.resolve();
+  }
+
+  static preemptTimerIfDone(context) {
+    let rootContext = ExecutionContext.getRoot(context);
+    --rootContext.timer.contention;
+    if (!rootContext.timer.contention) {
+      rootContext.timer.burn();
+    }
+    return rootContext.timer;
+  }
+
+  recordException(path, exception) {
+    if (this.parent) throw new Error("Non-root execution context");
+    let list = this.exceptions.get(path) || [];
+    if (!list.length) {
+      this.exceptions.set(path, list);
+    }
+    list.push(exception);
+  }
+
+  getTestResults() {
+    if (!this.loader) throw new Error("Disassociated execution context");
+    let help = this.loader.getCachedModule(InaftPathResolver.HELPER_PATH);
+    return help.exports.getResults();
+  }
+
+  static evaluate(context, name, text) {
+    var resolver = context.pathResolver;
+    var rootContext = ExecutionContext.getRoot(context);
+    try {
+      rootContext.loader.load(name, text, resolver);
+    } catch (ex) {
+      rootContext.recordException(name, ex);
+      return ex;
+    }
+    return null;
+  }
+
+  static getRoot(context) {
+    while (context.parent) {
+      context = context.parent;
+    }
+    return context;
+  }
+}
+/// </script>
+/// <script>
+/// export
+class ExecutionTimeout {
+  constructor() {
+    this.$cleanup = null;
+    this._promise = new Promise((resolve) => {
+      this._resolve = resolve;
+    });
+    this.contention = 0;
+  }
+
+  start($init) {
+    this.$cleanup = $init(this.burn.bind(this));
+  }
+
+  burn() {
+    if (this.$cleanup) {
+      this.$cleanup.call();
+    }
+    this._resolve();
+  }
+
+  then(...args) {
+    return this._promise.then.apply(this._promise, args);
+  }
+}
+/// </script>
+/// <script>
+/// import { InaftPathResolver } from "./InaftPathResolver.js";
+
+/// export
+class InaftTestHelper {
+  constructor(readable, timer) {
+    this._readable = readable;
+    this._timer = timer;
+
+    this.read = this.$read.bind(this);
+    this.test = this.$test.bind(this);
+    this.test.is = this.is = this.$is.bind(this);
+    this.test.ok = this.ok = this.$ok.bind(this);
+
+    this._blockers = [];
+
+    this._currentID = 1;
+    this._infos = [];
+  }
+
+  $read(path, wantRaw = false) {
+    let realPath = InaftPathResolver.getRealNameForMagicPath(path);
+    if (!realPath) {
+      throw new Error("Illegal read for path " + JSON.stringify(path));
+    }
+    return this._readable.read(realPath, wantRaw);
+  }
+
+  $is(a, b) {
+    if (a !== b) throw new Error(
+      "expected " + b + " got " + a
+    );
+  }
+
+  $ok(x) {
+    if (!x) throw new Error(
+      "expected true expression"
+    );
+  }
+
+  $test(callback) {
+    ++this._timer.contention;
+    let label = callback.name;
+    let info = new InaftTestHelper.TestInfo(this._currentID++, label);
+    this._infos.push(info);
+    let $checkSyncAndAsyncErrors = (() => {
+      try {
+        return Promise.resolve(callback());
+      } catch (ex) {
+        return Promise.reject(ex);
+      }
+    });
+
+    this._blockers.push(
+      new Promise((resolve) => {
+        $checkSyncAndAsyncErrors().catch((err) => {
+          info.failure = new InaftTestHelper.AbnormalExceptionError(err);
+        }).then(() => { // XXX read as `finally` (not yet widely supported)
+          info.stopped = true;
+          --this._timer.contention;
+          if (!this._timer.contention) {
+            this._timer.burn();
+          }
+        });
+
+        this._timer.then(() => {
+          if (!info.stopped) {
+            info.failure = new InaftTestHelper.TestTimeoutError();
+            info.stopped = true;
+          }
+          resolve();
+        });
+      })
+    );
+  }
+
+  getResults() {
+    return Promise.all(this._blockers).then(() => {
+      return new Promise((resolve) => {
+        resolve({
+          passed: !this._infos.filter((x) => !!x.failure).length,
+          details: this._infos.map((x) => x.toJSONObject())
+        });
+      })
+    });
+  }
+}
+
+InaftTestHelper.TestInfo = class TestInfo {
+  constructor(id, label) {
+    this.id = id;
+    this.label = label;
+    this.failure = null;
+    this.stopped = false;
+  }
+
+  toJSONObject() {
+    let result = Object.assign({ }, this);
+    if (this.failure) {
+      result.failure = {
+        message: this.failure.message,
+        stack: this.failure.stack
+      }
+    }
+    return result;
+  }
+}
+
+InaftTestHelper.AbnormalExceptionError =
+  class AbnormalExceptionError extends Error
+{
+  constructor(err) {
+    super("Abnormal exception from rejected promise or weird error type");
+
+    if (typeof(err) == "object" && err != null) {
+      var { message, stack } = err;
+    }
+
+    if (typeof(message) != "string") {
+      let $serialize = (err) => {
+        if (err === "") return "\"\" [empty string]";
+        if (!err) return String(err);
+        return JSON.stringify(err) || "definitely weird";
+      }
+      this.stack = null;
+      this.message += ": (" + $serialize(err) + ")";
+      err = this;
+    } else if (typeof(stack) != "string") {
+      err = Object.assign({ stack: null }, err);
+    }
+
+    return err;
+  }
+}
+
+InaftTestHelper.TestTimeoutError = class TestTimeoutError extends Error {
+  constructor() {
+    super("Inaft test timeout");
+  }
+}
+/// </script>
+/// <script>
+/// import { Require } from "./Require.js";
+
+/// export
+class Loader {
+  constructor() {
+    this._modules = new Map();
+  }
+
+  static createModule(id) {
+    return { id: id, exports: {} };
+  }
+
+  load(id, text, resolver) {
+    let module = this.getCachedModule(id);
+    if (module) return module;
+
+    module = this.cacheModule(Loader.createModule(id));
+    let require = new Require(module, this, resolver);
+    let $ = (new Function("require", "module", "exports", text));
+
+    try {
+      $(require, module, module.exports);
+    } catch (ex) {
+      this._modules.delete(id);
+      throw ex;
+    }
+
+    return module;
+  }
+
+  cacheModule(module) {
+    if (this.getCachedModule(module.id)) {
+      throw new Error("Module already cached: " + module.id);
+    }
+    this._modules.set(module.id, module);
+    return module;
+  }
+
+  getCachedModule(id) {
+    return this._modules.has(id) ?
+      this._modules.get(id) :
+      null;
+  }
+}
+/// </script>
+/// <script>
+/// export
+class Require {
+  constructor(module, loader, resolver) {
+    this._module = module;
+    this._loader = loader;
+    this._resolver = resolver;
+    return this.$require.bind(this);
+  }
+
+  $require(originalID) {
+    if (this._module) {
+      var relativeTo = this._module.id;
+    }
+    let module, id = this._resolver.handle(originalID, relativeTo);
+    if (id) {
+      module = this._loader.getCachedModule(id);
+      if (!module) {
+        module = this._loader.getCachedModule(id + ".js");
+      }
+    }
+    if (!module) {
+      let error = new Error(
+        "Cannot resolve module " + JSON.stringify(originalID)
+      );
+      if (this._module) {
+        error.message += " required by " + JSON.stringify(this._module.id)
+      }
+      throw error;
+    }
+    return module.exports;
+  }
+}
+/// </script>
+/// <script>
+/// export
+class BrowserQuirksHack {
+  constructor(window) {
+    this._document = window.document;
+    this._location = window.location;
+
+    this._frame = null;
+
+    this._isOuter = window.parent == window;
+  }
+
+  get inner() {
+    if (!this._isOuter) return null;
+    return this._frame.contentWindow;
+  }
+
+  static buildMarkup(name, content = []) {
+    let result = "<" + name + ">";
+    if (content != null) {
+      result += content.join("");
+      result += "<" + "/" + name + ">";
+    }
+    return result;
+  }
+
+  wrap() {
+    if (this._isOuter) {
+      if (this._location.search != "") {
+        throw new Error("Unexpected query string in URI");
+      }
+      let { body } = this._document;
+      body.style.margin = "0";
+      body.style.padding = "0";
+      body.innerHTML = BrowserQuirksHack.buildMarkup("iframe");
+      this._frame = body.firstChild;
+      this._frame.style.width = "100vw";
+      this._frame.style.height = "100vh";
+      this._frame.style.border = "0";
+      this._frame.style.margin = "0";
+      this._frame.src = this._location + "?";
+    } else {
+      let $$ = BrowserQuirksHack.buildMarkup;
+      let substitute =
+        $$("!doctype html", null) + "\n" +
+        $$("html", [
+          $$("head") + $$("body")
+        ]);
+      this._document.write(substitute);
+    }
+    return this.inner;
+  }
+}
+/// </script>
+/// <script>
+/// import { SimpleScanner } from "./SimpleScanner.js";
+/// import { TestMediator } from "./TestMediator.js";
+
+/// export
+class BrowserUI {
+  constructor(system, container) {
+    this._system = system;
+
+    const doc = container.ownerDocument;
+
+    BrowserUI.applySkin(doc.head);
+    BrowserUI.injectUIElements(container);
+
+    this._results = new Map();
+    this._uiState = new BrowserUI.UIState();
+
+    let $getItem = (selector) => doc.querySelectorAll(selector)[0];
+
+    this._overviewListBox = $getItem("#test-list");
+    this._overviewFailedLabel = $getItem("#overview-pane .failed.label");
+    this._overviewPassedLabel = $getItem("#overview-pane .passed.label");
+    this._overviewFailedSegment = $getItem("#overview-pane .failed.segment");
+    this._overviewEntriesBox = $getItem("#overview-pane .contents");
+    this._overviewLoadButton = $getItem("#file-source-chooser");
+
+    this._detailsTitleBox = $getItem("#details-pane .title");
+    this._detailsFailedLabel = $getItem("#details-pane .failed.label");
+    this._detailsPassedLabel = $getItem("#details-pane .passed.label");
+    this._detailsFailedSegment = $getItem("#details-pane .failed.segment");
+    this._detailsEntriesBox = $getItem("#details-pane .contents");
+
+    this._overviewLoadButton.onclick = () => void(this._system.getFiles());
+    this._overviewLoadButton.focus();
+
+    this._overviewListBox.addEventListener("click", this);
+
+    this._outer = doc.defaultView.parent;
+    doc.defaultView.addEventListener("message", this)
+  }
+
+  _updateUI(delta) {
+    const $ = JSON.stringify;
+    let oldState = this._uiState;
+    this._uiState = new BrowserUI.UIState(oldState, delta);
+    let properties = Object.keys(this._uiState);
+    for (let i = 0, n = properties.length; i < n; ++i) {
+      let name = properties[i];
+      if ($(this._uiState[name]) != $(oldState[name])) {
+        switch (name) {
+          case "configProblem":
+            this._alertBadConfig();
+          break;
+          case "newResults":
+          case "testPaths":
+            this._populateOverview();
+          break;
+          case "visibleDetails":
+            this._populateDetails();
+          break;
+        }
+      }
+    }
+  }
+
+  _populateOverview() {
+    this._overviewEntriesBox.classList.remove("beckoning");
+
+    const $ = BrowserUI.createMarkup;
+    const $escape = BrowserUI.escapeAsHTML;
+    const $attr = (type, path) => BrowserUI.concat(
+      'class="' + type + ' test-set"',
+      'data-test-path="' + $escape(path) + '"'
+    );
+
+    // NB: this may end up null here, due to a hack to give us a small bump
+    // for UI responsiveness.
+    const { testPaths } = this._uiState;
+    let total = testPaths && testPaths.length;
+    if (total == null) return;
+
+    let passCount = 0;
+    let failCount = 0;
+    let markup = new BrowserUI.TextSplice();
+    for (let i = 0, n = total; i < n; ++i) {
+      let type = "";
+      let results = this._results.get(testPaths[i]);
+      if (results && !results.skipped) {
+        if (results.passed && !results.metafailures.length) {
+          type = "passed";
+          ++passCount;
+        } else {
+          type = "failed";
+          ++failCount;
+        }
+      }
+      if (!results || !results.skipped) {
+        markup.append(
+          $('li', $attr(type, testPaths[i]), [
+            $('span', 'class="label"', [
+              $escape(BrowserUI.getShortNameFromTestPath(testPaths[i]))
+            ])
+          ])
+        );
+      }
+      if (results && results.skipped) {
+        --total;
+      }
+    }
+
+    if (passCount + failCount < total) {
+      this._overviewPassedLabel.classList.add("absent");
+      this._overviewFailedLabel.classList.add("absent");
+      this._changeFailBar(this._overviewFailedSegment);
+    } else {
+      this._overviewPassedLabel.textContent = passCount + " passed";
+      this._overviewPassedLabel.classList.remove("absent");
+      this._overviewFailedLabel.textContent = failCount + " failed";
+      this._overviewFailedLabel.classList.toggle("absent", !failCount);
+      this._changeFailBar(this._overviewFailedSegment, failCount / total);
+    }
+
+    this._overviewListBox.innerHTML = markup;
+  }
+
+  static getShortNameFromTestPath(path) {
+    return BrowserUI.getTestPathParts(path)[1];
+  }
+
+  static getTestPathParts(path, end = undefined) {
+    const start = "tests/".length;
+    if (end == undefined) end = path.indexOf("/", start);
+    let shortname = path.substring(start, end)
+    return [
+      path.substring(0, start),
+      shortname,
+      path.substring(start + shortname.length)
+    ];
+  }
+
+  _changeFailBar(segment, ratio) {
+    if (ratio == undefined) {
+      segment.style.width = 0;
+      segment.parentNode.classList.add("pending");
+    } else {
+      segment.style.width = (ratio * 100) + "%";
+      segment.parentNode.classList.remove("pending");
+    }
+  }
+
+  _populateDetails() {
+    const path = this._uiState.visibleDetails;
+    const results = this._results.get(path);
+
+    this._detailsTitleBox.innerHTML = this._createPathMarkup(path);
+
+    let content = new BrowserUI.TextSplice();
+    if (results) {
+      for (let i = 0, n = results.metafailures.length; i < n; ++i) {
+        let metafailure = results.metafailures[i];
+        content.append(this._createDetailItemMarkup(path, metafailure));
+      }
+
+      const details = results.details.slice().sort((a, b) => (a.id - b.id));
+      const total = details.length;
+
+      let failCount = 0;
+      for (let i = 0; i < total; ++i) {
+        const { id, failure, label } = details[i];
+        content.append(this._createDetailItemMarkup(path, failure, id, label));
+        if (failure) ++failCount;
+      }
+
+      if (results.metafailures.length > 0) {
+        this._changeFailBar(this._detailsFailedSegment, 1);
+        this._detailsFailedLabel.textContent = "failed";
+        this._detailsFailedLabel.classList.remove("absent");
+        this._detailsPassedLabel.classList.add("absent");
+      } else {
+        this._detailsFailedLabel.textContent = failCount + " failed";
+        this._detailsFailedLabel.classList.toggle("absent", !failCount);
+        if (!total) {
+          this._changeFailBar(this._detailsFailedSegment, 0);
+          this._detailsPassedLabel.textContent = "passed";
+        } else {
+          let passCount = total - failCount;
+          this._changeFailBar(this._detailsFailedSegment, failCount / total);
+          this._detailsPassedLabel.textContent = passCount + " passed";
+        }
+        this._detailsPassedLabel.classList.remove("absent");
+      }
+    } else {
+      this._detailsFailedLabel.classList.add("absent");
+      this._detailsPassedLabel.classList.add("absent");
+      this._changeFailBar(this._detailsFailedSegment);
+    }
+
+    this._detailsEntriesBox.innerHTML = content;
+  }
+
+  _createPathMarkup(path, end = undefined) {
+    const $ = BrowserUI.createMarkup;
+    let parts = BrowserUI.getTestPathParts(path, end);
+    parts[1] = $('span', 'class="shortname"', [
+      BrowserUI.escapeAsHTML(parts[1])
+    ]);
+    return String(new BrowserUI.TextSplice(parts));
+  }
+
+  _createDetailItemMarkup(path, failure, id = 0, label = null) {
+    const $ = BrowserUI.createMarkup;
+    const $escape = BrowserUI.escapeAsHTML;
+    if (failure) {
+      var errorHTML = $('div', 'class="error-info"', [
+        $escape(failure.message + "\n\n" + (failure.stack || failure.extra))
+      ]);
+      var type = "failed";
+    } else {
+      var type = "passed";
+    }
+
+    if (id > 0) {
+      if (!label) label = $escape(path) + " test #" + $escape(id);
+      var topbarHTML = $('div', 'class="item-info"', [
+        $('span', 'class="sigil"'),
+        $('span', 'class="label"', [ label ])
+      ]);
+    }
+
+    return $('div', 'class="' + type + ' test-detail"', [
+      topbarHTML || "",
+      errorHTML || ""
+    ]);
+  }
+
+  _alertBadConfig() {
+    this._changeFailBar(this._overviewFailedSegment, 1);
+    this._overviewEntriesBox.classList.remove("beckoning");
+
+    const path = "tests/config.json"; // XXX
+
+    this._detailsTitleBox.innerHTML = this._createPathMarkup(path, Infinity);
+    this._changeFailBar(this._detailsFailedSegment, 1);
+
+    this._detailsEntriesBox.innerHTML = this._createDetailItemMarkup(path, {
+      message: this._uiState.configProblem.outer,
+      extra: this._uiState.configProblem.inner
+    });
+  }
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "click": return void(this._onClick(event));
+      default: throw new Error("Unexpected event: " + event.type);
+    }
+  }
+
+  _onClick(event) {
+    this._selectTestSetFromClickedBox(event.target);
+  }
+
+  _selectTestSetFromClickedBox(node) {
+    let target = this._getHitTestSetItem(node);
+    let items = this._overviewListBox.querySelectorAll("li.test-set");
+    for (let i = 0, n = items.length; i < n; ++i) {
+      items[i].classList.toggle("selected", items[i] == target);
+    }
+    this._updateUI({
+      visibleDetails: target.dataset.testPath
+    });
+  }
+
+  _getHitTestSetItem(node) {
+    while (node) {
+      if (node.parentNode == this._overviewListBox &&
+          node.classList.contains("test-set")) {
+        return node;
+      }
+      node = node.parentNode;
+    }
+    return null;
+  }
+
+  acknowledgeTests(paths) {
+    this._updateUI({ testPaths: paths });
+  }
+
+  showConfigProblem(error) {
+    const outer = error.message;
+    const inner = error.innerException.message;
+    this._updateUI({ configProblem: { outer: outer, inner: inner } });
+  }
+
+  markTestAsSkipped(path) {
+    this._results.set(path, { skipped: true });
+    // Force an update (use new array slice to thwart identity comparison)
+    this._updateUI({ testPaths: this._uiState.testPaths.slice() });
+  }
+
+  showResults(path, results) {
+    this._results.set(path, results);
+    this._updateUI({ newResults: path });
+  }
+
+  static createChildElement(parent, childName) {
+    return parent.appendChild(parent.ownerDocument.createElement(childName));
+  }
+
+  static createMarkup(name, attributes = "", content = []) {
+    return (
+      "<" + name + " " + attributes + ">" +
+      content.join("") +
+      "<" + "/" + name + ">"
+    );
+  }
+
+  static concat() {
+    return Array.from(arguments).join("\n");
+  };
+
+  static escapeAsHTML(content) {
+    let result = "";
+    let scanner = new SimpleScanner(String(content));
+    while (scanner.position < scanner.text.length) {
+      let codePoint = scanner.readCodePoint();
+      switch (codePoint) {
+        case "<":
+          result += "&lt;";
+        break;
+        case ">":
+          result += "&gt;";
+        break;
+        case "&":
+          result += "&amp;";
+        break;
+        case " ":
+          result += "&nbsp;";
+        break;
+        case "\"":
+          result += "&quot;";
+        break;
+        case "'":
+          result += "&#x27;";
+        break;
+        default:
+          result += codePoint;
+        break;
+      }
+    }
+    return result;
+  }
+
+  static injectUIElements(body) {
+    const $ = BrowserUI.createMarkup;
+    body.innerHTML = BrowserUI.concat(
+      $('div', 'id="overview-pane" class="vertical-fill"', [
+        $('div', 'class="header"', [
+          $('span', 'class="title"', [ 'Test Sets' ]),
+          $('span', 'class="failed label"'),
+          $('span', 'class="passed label"')
+        ]),
+        $('div', 'class="pending separator"', [
+          $('div', 'class="failed segment"')
+        ]),
+        $('div', 'class="beckoning contents"', [
+          $('ul', 'id="test-list"'),
+          $('div', 'class="load-area"', [
+            $('button', 'id="file-source-chooser"', [ 'Open\u2026' ])
+          ])
+        ])
+      ]),
+      $('div', 'id="details-pane" class="vertical-fill"', [
+        $('div', 'class="header"', [
+          $('span', 'class="title"'),
+          $('span', 'class="failed label"'),
+          $('span', 'class="passed label"')
+        ]),
+        $('div', 'class="pending separator"', [
+          $('div', 'class="failed segment"')
+        ]),
+        $('div', 'class="contents"')
+      ])
+    );
+  }
+
+  static applySkin(head) {
+    let styleElement = BrowserUI.createChildElement(head, "style");
+    let $ = styleElement.sheet.insertRule.bind(styleElement.sheet);
+    $("body {" +
+      " background-color: #141618;" +
+      " color: rgba(255, 255, 255, 0.8);" +
+      " font-family: sans;" +
+      " font-weight: 500;" +
+      " margin: 0.5em;" +
+    "}");
+
+    $(".absent {" +
+      " display: none;" +
+    "}");
+
+    $(".vertical-fill {" +
+      /* NB: this factor must match container (body)'s margin above; also need
+       * to include offset for top+bottom border--it's not sufficient merely
+       * to set `box-sizing: border-box` for some reason... */
+      " height: calc(100vh - 2 * 0.5em - 2 * 1px);" +
+      " overflow-y: auto;" +
+    "}");
+
+    $("#overview-pane {" +
+      " min-width: 32ch;" +
+      " float: left;" +
+
+      /* NB: top/bottom must match border width from .vertical-fill above */
+      " border: 1px solid #101314;" +
+      " background-color: #1c2022;" +
+    "}");
+
+    $("#details-pane {" +
+      " background-color: #24282a;" +
+
+      /* NB: top/bottom must match border width from .vertical-fill above */
+      " border: 1px solid #101314;" +
+      " border-left: 0;" +
+      " border-right: 0;" +
+    "}");
+
+    $(".contents {" +
+      " padding: 1em;" +
+    "}");
+
+    $(".header {" +
+      " padding: 1em;" +
+      " font-weight: 600;" +
+      " font-stretch: semi-condensed;" +
+      " color: rgba(255, 255, 255, 0.4);" +
+    "}");
+
+    $(".load-area {" +
+      " text-align: center;" +
+      " padding: 4em 0;" +
+    "}");
+
+    $("#file-source-chooser {" +
+      " width: calc(100% - 2 * 1em - 2 * 1em);" +
+      " padding: 0.5em 1em;" +
+      " background-color: #161a1b;" +
+      " border: 1px solid #161a1b;" +
+      " border-radius: 2px;" +
+      " color: rgba(255, 255, 255, 0.8);" +
+    "}");
+
+    $("#file-source-chooser:hover {" +
+      " border: 1px solid #2b6287;" +
+      " color: rgba(255, 255, 255, 1.0);" +
+    "}");
+
+    $("#overview-pane .contents:not(.beckoning) .load-area {" +
+      " display: none;" +
+    "}");
+
+    $(".header .title {" +
+      " margin-right: 1.5em;" +
+    "}");
+
+    $(".header .failed.label {" +
+      " color: rgba(242, 119, 119, 0.8);" +
+      " margin-left: 0.75em;" +
+    "}");
+
+    $(".header .passed.label {" +
+      " color: rgba(93, 167, 0, 0.8);" +
+      " margin-left: 0.75em;" +
+    "}");
+
+    $(".separator {" +
+      " width: 100%;" +
+    "}");
+
+    $(".separator .failed.segment {" +
+      " width: 0;" +
+      " height: 2px;" +
+    "}");
+
+    $("#overview-pane .separator {" +
+      " background-color: rgba(93, 167, 0, 0.8);" +
+    "}");
+
+    $("#overview-pane .pending.separator {" +
+      " background-color: rgba(255, 255, 255, 0.4);" +
+    "}");
+
+    $("#overview-pane .separator .failed.segment {" +
+      " background-color: rgba(242, 119, 119, 0.8);" +
+    "}");
+
+    $("#details-pane .separator {" +
+      " background-color: rgba(93, 167, 0, 1.0);" +
+      /* NB: this left/right margin should match header padding */
+      " margin: 0 1em;" +
+      /* NB: the factor here should match the left/right margin above */
+      " width: calc(100% - 2 * 1em);" +
+    "}");
+
+    $("#details-pane .pending.separator {" +
+      " background-color: rgba(255, 255, 255, 0.5);" +
+    "}");
+
+    $("#details-pane .separator .failed.segment {" +
+      " background-color: rgba(242, 119, 119, 1.0);" +
+    "}");
+
+    $("#details-pane .header {" +
+      " color: rgba(255, 255, 255, 0.5);" +
+    "}");
+
+    $("#details-pane .header .shortname {" +
+      " color: rgba(255, 255, 255, 0.8);" +
+      " font-weight: 600;" +
+    "}");
+
+    $("#details-pane .header .failed.label {" +
+      " color: rgba(242, 119, 119, 1.0);" +
+    "}");
+
+    $("#details-pane .header .passed.label {" +
+      " color: rgba(93, 167, 0, 1.0);" +
+    "}");
+
+    $("#overview-pane ul, #overview-pane .contents {" +
+      " padding: 0;" +
+    "}");
+
+    $("#overview-pane .beckoning.contents #test-list {" +
+      " display: none;" +
+    "}");
+
+    $(".test-set {" +
+      " list-style-type: none;" +
+      " line-height: 2.25em;" +
+      " border-left: 2px solid transparent;" +
+      " cursor: pointer;" +
+      " color: rgba(255, 255, 255, 0.5);" +
+    "}");
+
+    $(".test-set:hover:not(.selected) {" +
+      " border-left-color: #2b6287;" +
+      " background-color: #161a1b;" +
+    "}");
+
+    $(".test-set.selected {" +
+      " background-color: #141618;" +
+      " border-left-color: #40a9f3;" +
+    "}");
+
+    $(".test-set:before {" +
+      " margin-left: 1em;" +
+      " content: '\\2739';" +
+    "}");
+
+    $(".failed.test-set {" +
+      " color: rgba(242, 119, 119, 0.8);" +
+    "}");
+
+    $(".failed.test-set:before {" +
+      " content: '\\2718';" +
+    "}");
+
+    $(".passed.test-set {" +
+      " color: rgba(93, 167, 0, 0.8);" +
+    "}");
+
+    $(".passed.test-set:before {" +
+      " content: '\\2714';" +
+    "}");
+
+    $(".test-set .label {" +
+      " margin: 1em;" +
+      " color: rgba(255, 255, 255, 0.8);" +
+    "}");
+
+    $(".test-detail {" +
+      " background-color: #1c2022;" +
+      " margin: 1em 0;" +
+      " border-radius: 2px;" +
+    "}");
+
+    $(".test-detail .item-info {" +
+      " line-height: 2em;" +
+    "}");
+
+    $(".test-detail .sigil {" +
+      " background-color: #191c1d;" +
+      " width: 2.25em;" +
+      " display: inline-block;" +
+      " text-align: center" +
+    "}");
+
+    $(".test-detail .label {" +
+      " padding: 0 0.75em;" +
+    "}");
+
+    $(".failed.test-detail .sigil:after {" +
+      " color: rgba(242, 119, 119, 1.0);" +
+      " content: '\\2718';" +
+    "}");
+
+    $(".failed.test-detail .error-info {" +
+      " color: rgba(255, 255, 255, 0.8);" +
+      " background-color: rgba(0, 0, 0, 0.5);" +
+      " font-family: monospace;" +
+      " white-space: pre-wrap;" +
+      " line-height: 2em;" +
+      " padding: 1em;" +
+      " overflow-x: auto;" +
+    "}");
+
+    $(".passed.test-detail .sigil:after {" +
+      " color: rgba(93, 167, 0, 1.0);" +
+      " content: '\\2714';" +
+    "}");
+  }
+}
+
+BrowserUI.TextSplice = class TextSplice {
+  constructor(parts = []) {
+    this._parts = parts;
+  }
+
+  append(markup) {
+    this._parts.push(markup);
+  }
+
+  toString() {
+    return this._parts.join("");
+  }
+}
+
+BrowserUI.UIState = class UIState {
+  constructor(oldState = null, delta = null) {
+    Object.assign(this, oldState, delta);
+  }
+}
+
+BrowserUI.UIState.prototype.configProblem = null;
+BrowserUI.UIState.prototype.newResults = null;
+BrowserUI.UIState.prototype.testPaths = null;
+BrowserUI.UIState.prototype.visibleDetails = null;
+/// </script>
+/// <script>
+/// export
+class TestMediator {
+  static forgeID(requests) {
+    do {
+      var id = (Math.random() * 0xFDB97531) >>> 0;
+    } while (requests.has(id));
+    return id;
+  }
+}
+
+TestMediator.EVAL_SCRIPT = "eval-script";
+TestMediator.READ_FILE = "read-file";
+TestMediator.REQUEST_RESULTS = "request-results";
+TestMediator.RESOLVE_EVAL = "resolve-eval";
+TestMediator.RESOLVE_READ = "resolve-read";
+TestMediator.REVIEW_RESULTS = "review-results";
+TestMediator.START_COUNTDOWN = "start-countdown";
+
+TestMediator.WorkerMessage = class WorkerMessage {
+  toString() {
+    return JSON.stringify(this);
+  }
+}
+
+TestMediator.EvalScriptWorkerMessage =
+class extends TestMediator.WorkerMessage {
+  constructor(fileName, contents, wantMagic, workOrders) {
+    super();
+    this.type = TestMediator.EVAL_SCRIPT;
+    this.value = contents;
+    this.name = fileName;
+    this.magic = wantMagic;
+    this.id = TestMediator.forgeID(workOrders);
+  }
+}
+
+TestMediator.ReadFileWorkerMessage =
+class extends TestMediator.WorkerMessage {
+  constructor(path, raw, workOrders) {
+    super();
+    this.type = TestMediator.READ_FILE;
+    this.value = path;
+    this.raw = raw;
+    this.id = TestMediator.forgeID(workOrders);
+  }
+}
+
+TestMediator.RequestResultsWorkerMessage =
+class extends TestMediator.WorkerMessage {
+  constructor(workOrders) {
+    super();
+    this.type = TestMediator.REQUEST_RESULTS;
+    this.id = TestMediator.forgeID(workOrders);
+  }
+}
+
+TestMediator.ResolveEvalWorkerMessage =
+class extends TestMediator.WorkerMessage {
+  constructor(evalRequestID, error = null, stack = null) {
+    super();
+    this.type = TestMediator.RESOLVE_EVAL;
+    this.error = error;
+    this.stack = stack;
+    this.ref = evalRequestID;
+  }
+}
+
+TestMediator.ResolveReadWorkerMessage =
+class extends TestMediator.WorkerMessage {
+  constructor(contents, readRequestID) {
+    super();
+    this.type = TestMediator.RESOLVE_READ;
+    this.value = contents;
+    this.ref = readRequestID;
+  }
+}
+
+TestMediator.ReviewResultsWorkerMessage =
+class extends TestMediator.WorkerMessage {
+  constructor(results, resultsRequestID) {
+    super();
+    this.type = TestMediator.REVIEW_RESULTS;
+    this.value = results;
+    this.ref = resultsRequestID;
+  }
+}
+
+TestMediator.StartCountdownWorkerMessage =
+class extends TestMediator.WorkerMessage {
+  constructor(millis) {
+    super();
+    this.type = TestMediator.START_COUNTDOWN;
+    this.value = millis;
+  }
+}
+/// </script>
+/// <script>
+/// export
+class FileCache {
+  constructor() {
+    this._blobs = new Map();
+  }
+
+  static normalizePath(path) {
+    if (path.startsWith("/")) return path.substr(("/").length);
+    if (path.startsWith("./")) return path.substr(("./").length);
+    return path;
+  }
+
+  store(blob, path) {
+    path = FileCache.normalizePath(path);
+    this._blobs.set(path, blob);
+  }
+
+  recall(path) {
+    path = FileCache.normalizePath(path);
+    return this._blobs.get(path);
+  }
+
+  list() {
+    return Array.from(this._blobs.keys());
+  }
+}
+/// </script>
+/// <script>
+/// import { FileCache } from "./FileCache.js";
+
+/// export
+class FileUtils {
+  static list(cache, path) {
+    path = FileCache.normalizePath(path);
+    if (!path.endsWith("/")) path += "/";
+
+    let kids = new Set();
+    let all = cache.list();
+    for (let i = 0, n = all.length; i < n; ++i) {
+      if (!all[i].startsWith(path)) continue;
+      let relative = all[i].substr(path.length);
+      let idx = relative.indexOf("/");
+      if (idx < 0) { // file
+        var name = relative;
+      } else { // subdirectory
+        var name = relative.substr(0, idx + 1);
+        // assert(name.endsWith("/"))
+      }
+      if (!kids.has(name)) {
+        kids.add(name);
+      }
+    }
+
+    return Array.from(kids.values());
+  }
+}
+/// </script>
+/// <script>
+/// export
+class System {
+  static create(system) {
+    let result = null;
+    try {
+      result = new system;
+    } catch (ex) {
+      if (!(ex instanceof System.ShuntingError)) {
+        throw ex;
+      }
+    }
+    return result;
+  }
+}
+
+System.ShuntingError = class ShuntingError extends Error { };
+/// </script>
+/// <script>
+/// import { FileCache } from "./FileCache.js";
+
+/// export
+class WebkitFileIngester {
+  static cache(fileList, cache = new FileCache()) {
+    if (!fileList.length) return null;
+
+    let $prefixOf = (path) => path.substr(0, path.indexOf("/", 1));
+    let prefix = $prefixOf(fileList[0].webkitRelativePath);
+    for (let i = 0; i < fileList.length; ++i) {
+      // assert($prefixOf(fileList[i].webkitRelativePath) == prefix)
+      let path = fileList[i].webkitRelativePath.substr(prefix.length);
+      cache.store(fileList[i], path);
+    }
+
+    return cache;
+  }
+
+  static readBlob(blob, raw = false) {
+    if (!blob) return Promise.resolve(null);
+    if (typeof(FileReader) != "undefined") {
+      let reader = new FileReader();
+      return new Promise(function(resolve) {
+        reader.addEventListener("loadend", resolve);
+        if (raw) {
+          reader.readAsArrayBuffer(blob);
+        } else {
+          reader.readAsText(blob);
+        }
+      }).then(function(event) {
+        return event.target.result;
+      });
+    }
+    throw new Error("FileReader API not implemented");
+  }
+}
+/// </script>
+/// <script>
+/// export ...
+var credits =
+` ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' '
+The primary work is inaft (0.9.8).
+Available under MIT License, unless otherwise noted.
+
+NB: Any auxiliary development tools, including but not limited to those
+distributed alongside the project source code and used to build the primary
+work, are separate works used under license compatible with this use and are
+not considered a part of the primary work.
+
+The primary work also incorporates elements from other works, which are
+indentified below.
+
+(The preceding notes are informational, and reproducing them is not itself
+intended to be a prerequisite for redistribution, although the inclusion of
+some of the content below may be required in order to redistribute the primary
+work in whole or in part.)
+
+Authorship and contributions
+============================
+
+* Colby Russell
+* Ives van Hoorne
+
+Works involved
+==============
+
+codesandbox.io test viewer visual design
+
+(Inspired Inaft's in-browser UI.  Used with permission.)
+
+    Copyright (C) 2018  Ives van Hoorne
+
+Licenses compatible for use in the primary work
+===============================================
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' `
+/// </script>
+/// <script>
+/// import { ExecutionContext } from "./ExecutionContext.js";
+/// import { FileReadAdapter } from "./FileReadAdapter.js";
+/// import { Sourcerer } from "./Sourcerer.js";
+/// import { TestRunner } from "./TestRunner.js";
+/// import { Loader } from "./Loader.js";
+/// import { InaftPathResolver } from "./InaftPathResolver.js";
+/// import { InaftTestHelper } from "./InaftTestHelper.js";
+/// import { FixedWidthResultsFormatter } from "./FixedWidthResultsFormatter.js";
+/// import { System } from "System.js";
+/// import { credits } from "./credits.js";
+
+/// export
+class NodeJSHandler {
+  constructor() {
+    if (typeof(process) == "undefined") {
+      throw new System.ShuntingError("not a NodeJS environment");
+    }
+
+    if (process.argv.indexOf("--version") >= 0) {
+      console.log(credits);
+      process.exit(0);
+    }
+
+    this._nodeFS = process.mainModule.require("fs");
+    this._nodePath = process.mainModule.require("path");
+    this._nodeVM = process.mainModule.require("vm");
+    this._process = process;
+
+    this._fileName = process.mainModule.filename;
+
+    let workDir = ".";
+    if (process.argv.length > 2) {
+      workDir = process.argv[2];
+    }
+    this._workDir = workDir;
+
+    this._table = null;
+
+    this._files = new FileReadAdapter(this._nodeFS, this._nodePath, workDir);
+    this._sourcerer = new Sourcerer(
+      this._nodeFS.readFileSync(this._fileName, { encoding: "utf8" })
+    );
+  }
+
+  run() {
+    let harness = new TestRunner(this);
+    harness.ontestexecute = this._showResults.bind(this);
+    harness.onpathsknown = (paths) => {
+      this._table = new FixedWidthResultsFormatter();
+      this._table.addColumn("status", { align: "center" });
+      this._table.addColumn("test set", { entries: paths });
+      this._table.addColumn("counts", { align: "right" });
+      console.log(this._table.formatHeader());
+    };
+    harness.onbadconfig = (error) => {
+      console.log(error.message + "\n\n" + error.innerException);
+    };
+    harness.runTests();
+  }
+
+  read(path, raw) {
+    return this._files.read(path, raw);
+  }
+
+  list(path) {
+    if (!path.startsWith("/")) {
+      path = this._nodePath.join(this._workDir, path);
+    }
+    return new Promise((resolve) => {
+      this._nodeFS.readdir(path, (err, fileNames) => {
+        if (err) return void(resolve(null));
+        resolve(fileNames.map((name) => {
+          let stats = this._nodeFS.statSync(path + name);
+          if (stats.isDirectory()) return name + "/";
+          return name;
+        }));
+      });
+    });
+  }
+
+  createContext(parent, wantMagic = false) {
+    if (parent) {
+      var context = new ExecutionContext(parent, wantMagic);
+    } else {
+      let sandbox = this._nodeVM.createContext({ console: console });
+      let iife = Sourcerer.makeIIFE(
+        this._sourcerer.extractClassDefinition(Loader) + "\n" +
+        this._sourcerer.extractClassDefinition(Require) + "\n" +
+        this._sourcerer.extractClassDefinition(InaftPathResolver) + "\n" +
+        "return new Loader();"
+      );
+
+      let loader = this._nodeVM.runInContext(iife, sandbox);
+      var context = ExecutionContext.createRoot(this, wantMagic, loader);
+    }
+    return Promise.resolve(context);
+  }
+
+  startCountdown(context, millis) {
+    return ExecutionContext.setUpTimer(context, ($finish) => {
+      let ref = setTimeout($finish, millis);
+      return () => void(clearTimeout(ref));
+    });
+  }
+
+  loadScript(context, fileName, fileText) {
+    ExecutionContext.evaluate(context, fileName, fileText);
+    return Promise.resolve();
+  }
+
+  _showResults(context, path) {
+    ExecutionContext.preemptTimerIfDone(context);
+    context.getTestResults().then((results) => {
+      this._printResults(path, results, context.exceptions);
+    });
+  }
+
+  _printResults(path, results, metafailures) {
+    const details = results.details;
+    const failed = details.filter((x) => (!!x.failure));
+    let status, count, countExtra = "";
+    if (results.passed && !metafailures.size) {
+      status = "pass";
+      if (details.length) {
+        count = details.length - failed.length;
+      } else {
+        count = "--";
+      }
+    } else {
+      status = "fail";
+      if (!metafailures.size) {
+        count = String(details.length - failed.length);
+        countExtra = " (of " + details.length + ")";
+      } else {
+        count = "!!!";
+      }
+    }
+    console.log(
+      this._table.formatRowText([ status, path, count ]) + countExtra
+    );
+  }
+}
+/// </script>
+/// <script>
+/// export
+class FileReadAdapter {
+  constructor(fs, path, workDir) {
+    this._nodeFS = fs;
+    this._nodePath = path;
+    this._workDir = workDir;
+  }
+
+  read(path, raw) {
+    path = this._nodePath.join(this._workDir, path);
+    if (!raw) {
+      var options = { encoding: "utf8" };
+    }
+
+    return new Promise((resolve) => {
+      void this._nodeFS.readFile(path, options, (err, contents) => {
+        if (raw) {
+          resolve(Uint8Array.from(contents))
+        } else {
+          resolve(contents)
+        }
+      });
+    });
+  }
+}
+/// </script>
+/// <script>
+/// export
+class FixedWidthResultsFormatter {
+  constructor() {
+    this._columns = [];
+  }
+
+  addColumn(header, options = {}) {
+    let width = header.length;
+    if (options.entries) {
+      for (let i = 0; i < options.entries.length; ++i) {
+        let current = options.entries[i];
+        if (current.length > width) {
+          width = current.length;
+        }
+      }
+    }
+    this._columns.push({
+      header: header,
+      width: width,
+      align: options.align || "left",
+    });
+  }
+
+  formatHeader() {
+    let values = [];
+    for (let i = 0; i < this._columns.length; ++i) {
+      values.push(this._columns[i].header);
+    }
+    return this.formatRowText(values);
+  }
+
+  formatRowText(cellValues) {
+    let result = "";
+    for (let i = 0; i < cellValues.length; ++i) {
+      if (i) result += "  ";
+      let value = String(cellValues[i]);
+      let columnInfo = this._columns[i];
+      if (columnInfo.align == "center") {
+        let lefted = this._pad(value, columnInfo.width, true);
+        let halfPad = ((lefted.length - value.length) / 2) | 0;
+        result += lefted.substr(halfPad) + lefted.substr(0, halfPad);
+      } else {
+        result += this._pad(
+          value, columnInfo.width, columnInfo.align == "right"
+        );
+      }
+    }
+    return result;
+  }
+
+  _pad(text, width, left) {
+    let padding = "";
+    while (width --> text.length) padding += " ";
+    if (left) {
+      return padding + text;
+    }
+    return text + padding;
+  }
+}
+/// </script>
+/// <script>
+/// import { BrowserHandler } from "./BrowserHandler.js";
+/// import { NodeJSHandler } from "./NodeJSHandler.js";
+/// import { System } from "./System.js";
+
+void function main() {
+  if (!system) var system = System.create(BrowserHandler);
+  if (!system) var system = System.create(NodeJSHandler);
+  if (!system) throw new System.ShuntingError("unknown environment");
+
+  system.run();
+} ();
+/// </script>
