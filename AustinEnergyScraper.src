@@ -1,0 +1,22 @@
+import { KubraScraper } from "./KubraScraper.src"
+
+export
+class AustinEnergyScraper extends KubraScraper {
+
+  // The `instanceID` and `viewID` are quasi-immutable; `KubraScraper` defines
+  // them as accessors so it can throw if a scraper is not instantiated as a
+  // more specialized class (like this one), and it's easier to just override
+  // the getters than it is to mess with property descriptors...
+
+  get instanceID() { return "dd9c446f-f6b8-43f9-8f80-83f5245c60a1" }
+
+  get viewID() { return "76446308-a901-4fa3-849c-3dd569933a51" }
+
+  constructor(system, accessToken = null) {
+    super(system, accessToken);
+
+    this.owner = "open-austin";
+    this.repo = "energy-outage-data";
+    this.filePath = "outages.json";
+  }
+}

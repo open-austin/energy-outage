@@ -1,6 +1,6 @@
 import { test, read } from "$TEST_HELPER";
 
-// XXX import { AustinEnergyScraper } from "$PROJECT/AustinEnergyScraper.src";
+import { AustinEnergyScraper } from "$PROJECT/AustinEnergyScraper.src";
 import { HARMockServer } from "$PROJECT/tests/HARMockServer.src";
 
 const HAR_PATH = "$PROJECT/tests/basics/capture.har";
@@ -163,4 +163,9 @@ test(function can_read_all_necessary_resources_from_capture() {
 
     return expectedStatus;
   }
+})
+
+test(async function main_recursive_scraping_action() {
+  let scraper = new AustinEnergyScraper(new HARMockServer(HAR_PATH, read));
+  await scraper.scrapeAndStore();
 })

@@ -1,0 +1,8 @@
+import { BaseScraper } from "./BaseScraper.src"
+
+export
+class DeltaScraper extends BaseScraper {
+  constructor(accessToken) {
+    super(accessToken);
+  }
+}

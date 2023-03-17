@@ -1,0 +1,40 @@
+export
+class BaseScraper {
+  constructor(accessToken) {
+    this.accessToken = accessToken;
+
+    this.lastData = null;
+    this.lastSHA = null;
+
+    this.owner = null;
+    this.repo = null;
+    this.filePath = null;
+    this.committer = null; // XXX differs
+
+    this.testMode = false;
+  }
+
+  async scrapeAndStore() {
+    let data = await this.fetchData();
+
+    if (!data) {
+      return void(this.print(`${this.filePath}; no data`)); // XXX I/O differs
+    }
+
+    if (this.testMode && !this.accessToken) {
+      return void(this.print(JSON.stringify(data)));
+    }
+
+    throw Error("GitHub storage not implemented"); // XXX
+  }
+
+  fetchData() {
+    return [];
+  }
+
+  print(...args) {
+    if (typeof(console) != "undefined") {
+      console.log(...args);
+    }
+  }
+}

@@ -1,0 +1,305 @@
+import { DeltaScraper } from "./DeltaScraper.src"
+import { Mapping } from "./Mapping.src"
+
+import { BoundingBoxTilingHack } from "./BoundingBoxTilingHack.src"
+
+export
+class KubraScraper extends DeltaScraper {
+  constructor(system, accessToken = null) {
+    super(accessToken);
+
+    this.baseURL = "https://kubra.io/";
+
+    // this.recordKey = "id"; // XXX
+    // this.noun = "outage"; // XXX
+
+    this.outages = new Map();
+
+    this.totalDownloaded = 0;
+    this.totalRequests = 0;
+
+    this._system = system;
+    this._prelock = new Promise(($unlock) => {
+      this._initialize($unlock);
+    });
+  }
+
+  // Reified scrapers must override this property:
+  get instanceID() {
+    throw Error("abstract KubraScraper has no Kubra instance ID");
+  }
+
+  // Reified scrapers must override this property:
+  get viewID() {
+    throw Error("abstract KubraScraper has no Kubra view ID");
+  }
+
+  async _initialize(onasynctasksfinished) {
+    let state = (await this._makeRequest(this.stateURL)).asJSON();
+    this.regionsKey = Object.keys(state["datastatic"])[0];
+    this.regions = state["datastatic"][this.regionsKey];
+    this.dataPath = state["data"]["interval_generation_data"];
+    this.clusterDataPath = state["data"]["cluster_interval_generation_data"];
+
+    this.deploymentID = state["stormcenterDeploymentId"];
+
+    let config = (await this._makeRequest(this.configURL)).asJSON();
+    let intervalData =
+      config["config"]["layers"]["data"]["interval_generation_data"];
+    let $isCluster = ((x) => (x["type"].startsWith("CLUSTER_LAYER")));
+    this.layerName = intervalData.filter($isCluster)[0]["id"];
+
+    this._dispatch(onasynctasksfinished, this);
+  }
+
+  _dispatch(handler, ...args) {
+    if (handler) handler.call(null, ...args);
+  }
+
+  get stateURL() {
+    return (
+      this.baseURL + "stormcenter/api/v1/stormcenters/" +
+      this.instanceID + "/views/" +
+      this.viewID + "/currentState?preview=false"
+    );
+  }
+
+  get configURL() {
+    return (
+      this.baseURL + "stormcenter/api/v1/stormcenters/" +
+      this.instanceID + "/views/" +
+      this.viewID + "/configuration/" +
+      this.deploymentID + "?preview=false"
+    );
+  }
+
+  get dataURL() {
+    return (
+      this.baseURL + this.dataPath + "/public/summary-1/data.json"
+    );
+  }
+
+  get serviceAreasURL() {
+    return (
+      this.baseURL + this.regions + "/" +
+      this.regionsKey + "/serviceareas.json"
+    );
+  }
+
+  async fetchData() {
+    await this._prelock;
+
+    let data = (await this._makeRequest(this.dataURL)).asJSON();
+
+    let quadkeys = await this._getServiceAreaQuadkeys();
+
+    let outages = await this._visit(quadkeys, new Set());
+
+    /* XXX
+    let outagesFound = 0;
+    let expectedOutages =
+      data["summaryFileData"]["totals"][0]["total_outages"];
+    if (outages.size) {
+      outagesFound = ([ ...outages.values() ]).
+        map((x) => (x["numberOut"])).
+        reduce((a, b) => (a + b));
+    }
+    if (outagesFound != expectedOutages) {
+      throw Error("Outages found does not match expected outages");
+    }
+    */
+
+    this.print(
+      (`Made ${this.totalRequests} requests,`),
+      (`fetching ${this.totalDownloaded / 1000} KB.`)
+    );
+
+    return Array.from(outages);
+  }
+
+  // NB: This goes by the unfortunate name `_fetch_data` in the original.
+  async _visit(quadkeys, old, zoom = KubraScraper.MIN_ZOOM, moar = false) {
+    const { Tile } = Mapping;
+
+    let outages = new Map();
+
+    for (let i = 0, n = quadkeys.length; i < n; ++i) {
+      let url = this._getQuadkeyURL(quadkeys[i]);
+      if (old.has(url)) {
+        this.print("Skipping", url);
+        continue;
+      }
+      old.add(url);
+      let res = await this._makeRequest(url);
+
+      this.print(
+        url, "Is cluster search?:", moar,
+        "Tile:", Tile.fromQuadkey(quadkeys[i])
+      );
+
+      if (!res.ok) {
+        this.print("Not found");
+        continue;
+      }
+
+      let json = res.asJSON();
+      for (let j = 0, n = json["file_data"].length; j < n; ++j) {
+        let o = json["file_data"][j];
+        this.print(o);
+        if ("cluster" in o["desc"]) {
+          let nextZoom = zoom + 1;
+          if (nextZoom > KubraScraper.MAX_ZOOM) {
+            this.print(
+              "We are at max zoom, we can't resolve incidents grouped closer",
+              "than zoom level 14."
+            );
+            let outageInfo = this._getOutageInfo(o, url);
+            outages.set(outageInfo.id, outageInfo);
+          } else {
+            this.print("Zooming in. Going to:", nextZoom);
+            let child = this._getQuadkeyForPoint(o["geom"]["p"][0], nextZoom);
+            outages = new Map(
+              ...(await this._visit([ child ], old, nextZoom, true)),
+              ...outages
+            );
+          }
+        } else {
+          this.print("Looking for neighbors");
+          let neighbors = this._getNeighboringQuadkeys(quadkeys[i]);
+          outages = new Map(
+            ...(await this._visit(neighbors, old, zoom)),
+            ...outages
+          );
+
+          let outageInfo = this._getOutageInfo(o, url);
+          outages.set(outageInfo.id, outageInfo);
+        }
+      }
+    }
+
+    this.print("Returning");
+    return outages;
+  }
+
+  _getQuadkeyURL(quadkey) {
+    let substitution = quadkey.substr(-3).split("").reverse().join("");
+    let dataPath = this.clusterDataPath.replace("{qkh}", substitution);
+    return (
+      (`${this.baseURL + dataPath}/public/${this.layerName}/${quadkey}.json`)
+    );
+  }
+
+  _getQuadkeyForPoint(point, zoom) {
+    let [ latitudeAndLongitude ] = this._decodePolyline(point);
+    let [ latitude, longitude ] = latitudeAndLongitude;
+    return Mapping.quadkey(Mapping.tile(latitude, longitude, zoom));
+  }
+
+  _getNeighboringQuadkeys(quadkey) {
+    const { Tile } = Mapping;
+
+    let tile = Tile.fromQuadkey(quadkey);
+    return ([
+      Mapping.quadkey(new Tile(tile.x, tile.y - 1, tile.z)),
+      Mapping.quadkey(new Tile(tile.x + 1, tile.y, tile.z)),
+      Mapping.quadkey(new Tile(tile.x, tile.y + 1, tile.z)),
+      Mapping.quadkey(new Tile(tile.x - 1, tile.y, tile.z)),
+
+      Mapping.quadkey(new Tile(tile.x + 1, tile.y - 1, tile.z)),
+      Mapping.quadkey(new Tile(tile.x + 1, tile.y + 1, tile.z)),
+      Mapping.quadkey(new Tile(tile.x - 1, tile.y + 1, tile.z)),
+      Mapping.quadkey(new Tile(tile.x - 1, tile.y - 1, tile.z))
+    ]);
+  }
+
+  async _getServiceAreaQuadkeys() {
+    const Mapping = new BoundingBoxTilingHack(); // XXX
+
+    let res = (await this._makeRequest(this.serviceAreasURL)).asJSON();
+    let areas = res["file_data"][0]["geom"]["a"];
+
+    let points = [];
+    for (let i = 0, n = areas.length; i < n; ++i) {
+      points.push(...this._decodePolyline(areas[i]));
+    }
+
+    let bbox = this._getBoundingBox(points);
+
+    const { quadkey } = Mapping;
+    const { tiles } = Mapping;
+
+    return tiles(...bbox, [ KubraScraper.MIN_ZOOM ]).map(quadkey);
+  }
+
+  _getBoundingBox(points) {
+    let xs = points.map(([ x, y ]) => (x));
+    let ys = points.map(([ x, y ]) => (y));
+    return [
+      Math.min(...ys), Math.min(...xs), Math.max(...ys), Math.max(...xs)
+    ];
+  }
+
+  async _makeRequest(path) {
+    let result = await this._system.read(path);
+    if (result.ok) {
+      this.totalDownloaded += result.selection.length;
+    }
+    this.totalRequests += 1;
+    return result;
+  }
+
+  _getOutageInfo(rawOutage, url) {
+    let { desc } = rawOutage;
+    let cause = ("cause" in desc && desc["cause"]) || null;
+
+    let loc = this._decodePolyline(rawOutage["geom"]["p"][0]);
+
+    if ("inc_id" in desc && desc["inc_id"]) {
+      var id = desc["inc_id"];
+    } else {
+      var id = rawOutage["geom"]["p"][0] + "-" + desc["start_time"];
+    }
+
+    return {
+      id: id,
+      etr: desc["etr"],
+      etrConfidence: desc["etr_confidence"],
+      cluster: desc["cluster"],
+      comments: desc["comments"],
+      cause: cause && cause["EN-US"],
+      numberOut: desc["n_out"],
+      custAffected: desc["cust_a"]["val"],
+      crewStatus: desc["crew_status"],
+      startTime: desc["start_time"],
+      latitude: loc[0][0],
+      longitude: loc[0][1],
+      source: url
+    }
+  }
+
+  // XXX This currently returns dummy data that's not just hardcoded for a
+  // given input but also wrong for that input.
+  _decodePolyline(encoding) {
+    if (encoding.length == 6356 && encoding.startsWith("}oayDt`osQ`KbJjB`") &&
+        encoding.endsWith("AsF_AmJuFyFuE_GuAa@}@i@aCaB{DoBk]rKiUwjAjeBag@")) {
+      return ([
+        [ 30.50357, -97.83156 ],
+        [ 30.50357, -97.65590 ],
+        [ 30.36815, -97.48025 ],
+        [ 30.23274, -97.48025 ],
+        [ 30.09733, -97.65590 ],
+        [ 30.09733, -97.83156 ],
+        [ 30.23274, -98.00722 ],
+        [ 30.36815, -98.00722 ]
+      ]);
+    }
+    throw Error("unimplemented polyline decoding");
+  }
+
+  print(...args) {
+    this._system.log(...args);
+  }
+}
+
+KubraScraper.MIN_ZOOM = 7;
+KubraScraper.MAX_ZOOM = 14;

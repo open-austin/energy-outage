@@ -7,6 +7,8 @@ class HARMockServer {
     this.capturePath = pathToCapturedHAR;
     this.$actuallyReadFileContents = asyncReadFileHelper;
 
+    this._logs = [];
+
     this.cache = new Map();
     this.data = null;
   }
@@ -41,6 +43,10 @@ class HARMockServer {
     }
 
     return new Result(null);
+  }
+
+  log(...args) {
+    this._logs.push(args);
   }
 }
 
