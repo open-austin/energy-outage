@@ -1,0 +1,69 @@
+// Partial replacement for the "mercantile" Python module; original reference:
+// <https://learn.microsoft.com/en-us/bingmaps/articles/bing-maps-tile-system>
+
+export
+class Mapping {
+  static tile(latitude, longitude, zoom) {
+    const { Tile } = Mapping;
+
+    let n = Math.pow(2, zoom);
+    let x = (longitude + 180) / 360 * n;
+
+    const { PI:pi } = Math;
+    let radians = latitude * (pi / 180);
+    let y = (
+      (1 - Math.log(Math.tan(radians) + (1 / Math.cos(radians))) / pi) / 2 * n
+    );
+
+    return new Tile(Math.floor(x), Math.floor(y), zoom);
+  }
+
+  static quadkey(tile) {
+    let result = "";
+    for (let i = tile.z; i > 0; --i) {
+      let digit = 0;
+      if (tile.x & (1 << (i - 1))) digit += 1;
+      if (tile.y & (1 << (i - 1))) digit += 2;
+      result += digit.toString();
+    }
+    return result;
+  }
+}
+
+Mapping.Tile = class Tile {
+  // Our analog of MS's `QuadKeyToTileXY` and `mercantile.quadkey_to_tile`.
+  static fromQuadkey(quadkey) {
+    let x = 0;
+    let y = 0;
+    let z = quadkey.length;
+
+    for (let i = z; i > 0; --i) {
+      switch (quadkey.charAt(z - i)) {
+        case "3":
+          x |= 1 << (i - 1);
+          y |= 1 << (i - 1);
+        break;
+        case "2":
+          y |= 1 << (i - 1);
+        break;
+        case "1":
+          x |= 1 << (i - 1);
+        break;
+        case "0":
+          // no-op
+        break;
+        default:
+          throw Error("bad quadkey");
+        break;
+      }
+    }
+
+    return new Tile(x, y, z);
+  }
+
+  constructor(x, y, z) {
+    this.x = x;
+    this.y = y;
+    this.z = z;
+  }
+}
