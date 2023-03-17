@@ -28,6 +28,11 @@ class Mapping {
     }
     return result;
   }
+
+  static tiles(west, south, east, north, zooms) {
+    // XXX See `BoundingBoxHackMappingUtility`.
+    throw Error("unimplemented Mapping.tiles");
+  }
 }
 
 Mapping.Tile = class Tile {

@@ -1,0 +1,42 @@
+/*
+ * This is a total hack.  It is designed to be deleted.  It implements a stub
+ * method that's hardcoded to expect coordinates for a bounding box around
+ * Austin.  It will return an appropriate tile for x=29, y=52 at the only
+ * supported zoom- level (7).
+ *
+ * When will it be safe to delete this hack?  A: When `Mapping.tiles` has been
+ * implemented for real.
+ *
+ * How do we excise this from the codebase once the missing method has been
+ * implemented?  A: The text `const Mapping = new BoundingBoxTilingHack()`
+ * should appear somewhere in a module that also imports the `Mapping` module
+ * that this hack expects to be able to masquerade as.  Just delete that line.
+ */
+
+import { Mapping } from "./Mapping.src";
+
+export
+class BoundingBoxTilingHack {
+  constructor() {
+    let result = Object.create(Mapping, { "tiles": { writable: true } });
+    result.tiles = BoundingBoxTilingHack.getAustinAreaTiling;
+    return result;
+  }
+
+  static getAustinAreaTiling(west, south, east, north, zooms) {
+    let [ zoomLevel, ...rest ] = zooms;
+
+    if (!rest.length && zoomLevel == 7) {
+      const { Tile } = Mapping;
+
+      if ((north | 0) != 30) throw Error("outside expected range: " + north);
+      if ((south | 0) != 30) throw Error("outside expected range: " + south);
+      if ((east | 0) != -97) throw Error("outside expected range: " + east);
+      if ((west | 0) != -98) throw Error("outside expected range: " + west);
+
+      return [ new Tile(29, 52, 7) ];
+    }
+
+    throw Error("unexpected generality");
+  }
+}
