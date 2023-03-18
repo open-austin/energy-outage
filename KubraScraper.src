@@ -190,7 +190,7 @@ class KubraScraper extends DeltaScraper {
   }
 
   _getQuadkeyForPoint(point, zoom) {
-    let [ latitudeAndLongitude ] = this._decodePolyline(point);
+    let [ latitudeAndLongitude ] = Mapping.decodePolyline(point);
     let [ latitude, longitude ] = latitudeAndLongitude;
     return Mapping.quadkey(Mapping.tile(latitude, longitude, zoom));
   }
@@ -220,7 +220,7 @@ class KubraScraper extends DeltaScraper {
 
     let points = [];
     for (let i = 0, n = areas.length; i < n; ++i) {
-      points.push(...this._decodePolyline(areas[i]));
+      points.push(...Mapping.decodePolyline(areas[i]));
     }
 
     let bbox = this._getBoundingBox(points);
@@ -252,7 +252,7 @@ class KubraScraper extends DeltaScraper {
     let { desc } = rawOutage;
     let cause = ("cause" in desc && desc["cause"]) || null;
 
-    let loc = this._decodePolyline(rawOutage["geom"]["p"][0]);
+    let loc = Mapping.decodePolyline(rawOutage["geom"]["p"][0]);
 
     if ("inc_id" in desc && desc["inc_id"]) {
       var id = desc["inc_id"];
@@ -271,29 +271,10 @@ class KubraScraper extends DeltaScraper {
       custAffected: desc["cust_a"]["val"],
       crewStatus: desc["crew_status"],
       startTime: desc["start_time"],
-      latitude: loc[0][0],
-      longitude: loc[0][1],
+      latitude: loc[0][0].toFixed(5),
+      longitude: loc[0][1].toFixed(5),
       source: url
     }
-  }
-
-  // XXX This currently returns dummy data that's not just hardcoded for a
-  // given input but also wrong for that input.
-  _decodePolyline(encoding) {
-    if (encoding.length == 6356 && encoding.startsWith("}oayDt`osQ`KbJjB`") &&
-        encoding.endsWith("AsF_AmJuFyFuE_GuAa@}@i@aCaB{DoBk]rKiUwjAjeBag@")) {
-      return ([
-        [ 30.50357, -97.83156 ],
-        [ 30.50357, -97.65590 ],
-        [ 30.36815, -97.48025 ],
-        [ 30.23274, -97.48025 ],
-        [ 30.09733, -97.65590 ],
-        [ 30.09733, -97.83156 ],
-        [ 30.23274, -98.00722 ],
-        [ 30.36815, -98.00722 ]
-      ]);
-    }
-    throw Error("unimplemented polyline decoding");
   }
 
   print(...args) {
