@@ -347,3 +347,18 @@ test(function tile_from_quadkey() {
   test.is(tile.y, 106);
   test.is(tile.z, 8);
 })
+
+test(function polylines() {
+  const { decodePolyline } = Mapping;
+
+  function $(pair) {
+    return pair.map(([ x, y ]) => ([ x.toFixed(5), y.toFixed(5) ]));
+  }
+
+  test.is(String($(decodePolyline("wpqwDx~gsQ"))), "30.24156,-97.69469");
+  test.is(String($(decodePolyline("wxdxDh|tsQ"))), "30.34012,-97.76085");
+  test.is(String($(decodePolyline("gqexD|blsQ"))), "30.34404,-97.71583");
+  test.is(String($(decodePolyline("{|lxDxocsQ"))), "30.38174,-97.67181");
+  test.is(String($(decodePolyline("goswDnvnsQ"))), "30.25156,-97.72920");
+  test.is(String($(decodePolyline("cpsxDfbdsQ"))), "30.41554,-97.67476");
+})

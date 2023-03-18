@@ -33,6 +33,50 @@ class Mapping {
     // XXX See `BoundingBoxHackMappingUtility`.
     throw Error("unimplemented Mapping.tiles");
   }
+
+  // cf "Encoded Polyline Algorithm Format". developers.google.com.
+  static decodePolyline(encoding) {
+    let points = [];
+
+    let latitude = 0;
+    let longitude = 0;
+
+    let ax = 1;
+    let bitMargin = 0;
+    for (let i = 0, n = encoding.length; i < n; ++i) {
+      let bits = encoding.charCodeAt(i) - 0x40;
+      ax += bits << bitMargin;
+      bitMargin += 5;
+
+      if (bits < 0x1F) {
+        latitude += (ax & 1) ?
+          ~(ax >> 1) :
+          ax >> 1;
+
+        ax = 1;
+        bitMargin = 0;
+        while (++i < n) {
+          let bits = encoding.charCodeAt(i) - 0x40;
+          ax += bits << bitMargin;
+          bitMargin += 5;
+
+          if (bits < 0x1F) {
+            longitude += (ax & 1) ?
+               ~(ax >> 1) :
+               ax >> 1;
+            break;
+          }
+        }
+
+        points.push([ latitude * 1E-5, longitude * 1E-5 ]);
+
+        ax = 1;
+        bitMargin = 0;
+      }
+    }
+
+    return points;
+  }
 }
 
 Mapping.Tile = class Tile {
