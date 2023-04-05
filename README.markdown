@@ -7,7 +7,7 @@ The scraping logic is complete.  You can run the tests:
 
 1. Open the test runner tests/harness.app.htm
 2. Click the "Open..." button in the sidebar
-3. Point it at the procject source code (i.e. this directory)
+3. Point it at the project source code (i.e. this directory)
 
 (Alternatively, if you have NodeJS installed and don't want to have to spend
 time clicking around and reloading the test harness, then you can run the
