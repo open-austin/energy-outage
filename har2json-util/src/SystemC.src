@@ -1,0 +1,132 @@
+import { FileNodeFSAdapter } from "./FileNodeFSAdapter.src";
+import { SystemA } from "./SystemA.src";
+import { credits } from "./credits.src";
+
+export
+class SystemC extends SystemA {
+  constructor() {
+    super();
+
+    if (typeof(console) == "undefined" ||
+        typeof(process) == "undefined" ||
+        typeof(module) == "undefined") {
+      throw new SystemA.ShuntingError("Not a NodeJS environment");
+    }
+
+    if (process.argv.indexOf("--version") >= 0) {
+      console.log(credits);
+      process.exit(SystemC.EXIT_SUCCESS);
+    }
+
+    const fs = module.require("fs");
+    const path = module.require("path");
+
+    this._process = process;
+
+    let [ engine, script, ...eargs ] = process.argv;
+    this._engine = engine;
+    this._script = script;
+    this._args = eargs;
+
+    /*
+    this.output = new ConsoleOutput({
+      printLine: ((text) => (void(console.log(text))))
+    });
+    */
+
+    this._files = new FileNodeFSAdapter(fs, path);
+
+    this._report = ((...what) => (void(console.error(...what))));
+  }
+
+  setUpForExec($$constructor) {
+    if (this._args.length) {
+      let app = new $$constructor(this);
+      return Promise.resolve(app);
+    }
+    return Promise.reject(new SystemC.ArgError);
+  }
+
+  finish(app, err = null) {
+    if (err) {
+      const { NoSuchFileError } = SystemA;
+      if (err instanceof SystemC.ArgError) {
+        this._report(err.message);
+
+        // If we were supporting interactive commands, here we could also do:
+        //
+        //   this._report(
+        //     "Usage: " + engine + " " + script + " <command> FILE" + "\n" +
+        //     "Available commands:" + "\n\n" + commandList
+        //   );
+
+        var status = SystemC.EXIT_BADARGS;
+      } else if (err instanceof NoSuchFileError) {
+        var status = SystemC.EXIT_BADFILE;
+      } else {
+        this._report("Unrecognized error:", err);
+        var status = SystemC.EXIT_EXECERR;
+      }
+
+      if (status == undefined) {
+        this._report("Unhandled error:", err);
+        status = SystemC.EXIT_EXECERR;
+      }
+
+      return void(this._process.exit(status));
+    }
+
+    this._process.exit(SystemC.EXIT_SUCCESS);
+  }
+
+  getProgramArguments() {
+    const { ArgError } = SystemC;
+
+    if (this._args.length == 1) { // XXX
+      return this._args;
+    }
+
+    throw new ArgError();
+  }
+
+  read(path) {
+    return this._files.read(path).catch((err) => {
+      return this._wrapFSError(err, path);
+    });
+  }
+
+  write(path, contents) {
+    return this._files.write(path, contents).catch((err) => {
+      return this._wrapFSError(err, path);
+    });
+  }
+
+  list(path) {
+    return this._files.list(path).catch((err) => {
+      return this._wrapFSError(err, path);
+    });
+  }
+
+  _wrapFSError(nodeError, path) {
+    const { NoSuchFileError } = SystemA;
+    switch (nodeError.code) {
+      case "ENOENT":
+        return Promise.reject(new NoSuchFileError(path));
+      break;
+    }
+    return Promise.reject(nodeError);
+  }
+}
+
+SystemC.EXIT_EXECERR = -1;
+SystemC.EXIT_SUCCESS = 0;
+SystemC.EXIT_BADARGS = 1;
+SystemC.EXIT_BADFILE = 2;
+
+SystemC.EXIT_BADTEXT = 10;
+
+SystemC.ArgError = class ArgError extends Error {
+  constructor() {
+    super("wrong number of arguments");
+  }
+}

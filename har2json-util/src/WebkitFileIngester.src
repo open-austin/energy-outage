@@ -1,0 +1,36 @@
+import { FileCache } from "./FileCache.src";
+
+export
+class WebkitFileIngester {
+  static cache(fileList, cache = new FileCache()) {
+    if (!fileList.length) return null;
+
+    let $prefixOf = ((path) => path.substr(0, path.indexOf("/", 1)));
+    let prefix = $prefixOf(fileList[0].webkitRelativePath);
+    for (let i = 0; i < fileList.length; ++i) {
+      // assert($prefixOf(fileList[i].webkitRelativePath) == prefix)
+      let path = fileList[i].webkitRelativePath.substr(prefix.length);
+      cache.store(fileList[i], path);
+    }
+
+    return cache;
+  }
+
+  static readBlob(blob, raw = false) {
+    if (!blob) return Promise.resolve(null);
+    if (typeof(FileReader) != "undefined") {
+      let reader = new FileReader();
+      return new Promise(function(resolve) {
+        reader.addEventListener("loadend", resolve);
+        if (raw) {
+          reader.readAsArrayBuffer(blob);
+        } else {
+          reader.readAsText(blob);
+        }
+      }).then(function(event) {
+        return event.target.result;
+      });
+    }
+    throw new Error("FileReader API not implemented");
+  }
+}

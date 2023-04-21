@@ -1,0 +1,65 @@
+import { ConsoleAppStyle } from "./ConsoleAppStyle.src";
+
+export
+class BrowserUI {
+  constructor(capos, document) {
+    this._capos = capos;
+    this._document = document;
+
+    /*
+    this._vtty = new ConsoleBuffer();
+    let writer = new LineWriter(this._vtty);
+    this.input = new LineReader(this._vtty, writer);
+    this.output = new ConsoleOutput(writer);
+
+    this._tabBox = null;
+    this.console = null;
+    */
+
+    this._injectUI();
+  }
+
+  _injectUI() {
+    let container = this._fixQuirks();
+    ConsoleAppStyle.applySkin(this._document.body.parentNode);
+
+    let $$ = this._document.createElement.bind(this._document);
+
+    let loadArea = container.appendChild($$("div"));
+    loadArea.className = "load-area";
+
+    let loadButton = $$("label");
+    loadButton.className = "empty file-source-chooser";
+    loadButton.textContent = "Open\u2026";
+    loadButton.style.fontFamily = "sans";
+    this._loadButton = loadArea.appendChild(loadButton);
+
+    /*
+    this._tabBox = new TabBox(container);
+    let consolePanel = this._tabBox.addTab("Console");
+
+    consolePanel.classList.add("console-panel");
+    this.console = new ConsoleWidget(consolePanel, this._vtty, this.input);
+    this.console.focus();
+
+    this._tabBox.ontabswitch = ((panel) => {
+      if (panel == consolePanel) this.console.focus();
+    });
+    */
+
+    this._loadButton.onclick = (() => void(this._capos.requestFileSource()));
+  }
+
+  _fixQuirks(title = "") {
+    this._document.open();
+    this._document.write(
+      "<!DOCTYPE html><html><head><meta charset='utf-8'><title>" + title
+    );
+    this._document.close();
+    return this._document.body;
+  }
+
+  acknowledgeFileSource() {
+    this._loadButton.classList.remove("empty");
+  }
+}

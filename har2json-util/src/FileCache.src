@@ -1,0 +1,26 @@
+export
+class FileCache {
+  constructor() {
+    this._blobs = new Map();
+  }
+
+  static normalizePath(path) {
+    if (path.startsWith("/")) return path.substr(("/").length);
+    if (path.startsWith("./")) return path.substr(("./").length);
+    return path;
+  }
+
+  store(blob, path) {
+    path = FileCache.normalizePath(path);
+    this._blobs.set(path, blob);
+  }
+
+  recall(path) {
+    path = FileCache.normalizePath(path);
+    return this._blobs.get(path);
+  }
+
+  list() {
+    return Array.from(this._blobs.keys());
+  }
+}

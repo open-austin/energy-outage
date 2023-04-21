@@ -1,0 +1,56 @@
+export
+class ConsoleAppStyle {
+  static applySkin(parent) {
+    let styleElement = parent.ownerDocument.createElement("style");
+    parent.appendChild(styleElement);
+
+    let $ = styleElement.sheet.insertRule.bind(styleElement.sheet);
+    $("body {" +
+        "margin: 0.5em;" +
+        "background-color: #f0f5f8;" +
+    "}");
+
+    $(".tab-strip label.selected {" +
+        "border-top: 4px solid #58b;" +
+        "background-color: #FFF;" +
+    "}");
+
+    $(".load-area {" +
+        "float: right;" +
+        "margin: 0.5em 0;" +
+    "}");
+
+    $(".file-source-chooser {" +
+        "padding: 0.5em 1em 0.5em 1em;" +
+        "border: 1px solid #c5c8cb;" +
+        "border-radius: 4px;" +
+    "}");
+
+    $(".file-source-chooser.empty, .file-source-chooser:hover {" +
+        "background-color: #fff;" +
+    "}");
+
+    $(".term-content {" +
+        "color: #f5f8fb;" +
+        "background-color: #15181b;" +
+    "}");
+
+    $(".term-clipboard {" +
+        "color: #f5f8fb;" +
+        "background-color: #15181b;" +
+        "border: 4px solid #58b;" +
+        "border-radius: 2px;" +
+        "padding: 0.5em;" +
+    "}");
+
+    $(".term-clipboard::selection {" +
+        "background-color: #58b;" +
+    "}");
+
+    $(".console-panel {" +
+        "background-color: #15181b;" +
+        "height: calc(100vh - 4.25em);" +
+        "padding: 0.25em" +
+    "}");
+  }
+}
