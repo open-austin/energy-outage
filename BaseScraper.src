@@ -18,7 +18,7 @@ class BaseScraper {
     let data = await this.fetchData();
 
     if (!data) {
-      return void(this.print(`${this.filePath}; no data`)); // XXX I/O differs
+      return void(this.print(this.filePath + "; no data")); // XXX I/O differs
     }
 
     if (this.testMode && !this.accessToken) {
