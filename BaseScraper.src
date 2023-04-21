@@ -33,8 +33,8 @@ class BaseScraper {
   }
 
   print(...args) {
-    if (typeof(console) != "undefined") {
-      console.log(...args);
-    }
+    // This should ultimately be handled by whatever is responsible for
+    // implementing the abstract system interface.
+    throw Error("abstract base class's print method not implemented");
   }
 }
