@@ -1,0 +1,5685 @@
+/// <script>
+/*
+ * trplkt is the triplescripts.org group's reference compiler.  If you're
+ * looking at this right now, it's most likely one of the following reasons...
+ *
+ * - you're working on trplkt, or (more likely):
+ * - some other project you're dealing with is using triple scripts--maybe
+ *   that project itself is a triple script
+ *
+ * One indicator that it's the latter would be if you opened a file named
+ * Build.app.htm and that's what you're reading right now.  If so, there
+ * should've also been a README explaining how to use Build.app.htm.  (If
+ * there aren't any instructions, try filing a bug against the project.)
+ */
+
+/// import { AcknowledgeMint } from "./AcknowledgeMint.src";
+/// import { CommonErrors } from "./CommonErrors.src";
+/// import { CompilerItem } from "./CompilerItem.src";
+/// import { Emitter } from "./Emitter.src";
+/// import { InputIR } from "./InputIR.src";
+/// import { PathResolver } from "./PathResolver.src";
+/// import { ProgramLinkage } from "./ProgramLinkage.src";
+/// import { ProgramText } from "./ProgramText.src";
+/// import { RealParser } from "./RealParser.src";
+
+/// export
+class TripleKit {
+  // More info about this stuff is available at <https://triplescripts.org>.
+  //
+  // The primary use case for trplkt involves two things:
+  // - compiling a triple script
+  // - decompiling a triple script
+  //
+  // It's here in `TripleKit` where the heart of the trplkt compiler resides--
+  // particularly the `build` and `decompile` methods below.
+  //
+  // (If you want to understand where the real "entry point" for the compiler
+  // is, refer to trplkt's function `main`--the so-called "shunting block",
+  // which is the first thing that executes; it's responsible for initializing
+  // the "system" layer.  From main.src, you can trace control flow through
+  // the system layer(s) to the command processor, which is ultimately what
+  // ends up dispatching one of our `build`, `decompile`, etc. methods here.)
+  //
+  // The system layer is how trplkt interfaces with the underlying host
+  // environment for reading files, etc.  See the class `SystemA` for the
+  // rationale for that design pattern and details about the operations we
+  // depend on in the heart of the compiler here in the "application" layer.
+  constructor(system) {
+    this._system = system;
+  }
+
+  ////////////////////////////////////////////////////////////////////////////
+
+  build(paths, shunt, fileName = "out.app.htm") {
+    let shuntID = PathResolver.normalizePath(shunt);
+    if (paths) {
+      var roots = paths.map((x) => (PathResolver.normalizePath(x)));
+    } else {
+      var roots = [];
+    }
+    roots.push(shuntID);
+
+    let cache = new Map();
+    let processing = new Set();
+
+    let pending = [];
+    let parser = new RealParser();
+    for (let i = 0, n = roots.length; i < n; ++i) {
+      // NB: Every call here should be generating a de novo item.
+      let item = CompilerItem.BuildItem.getCachedItem(roots[i], cache);
+      pending.push(this._cueAsyncWorkOnInput(item, processing, parser));
+    }
+
+    let linkage = new ProgramLinkage(cache);
+    let emitter = new Emitter(InputIR.GBlock);
+
+    return Promise.all(pending).then(() => {
+      const { DialectError } = CommonErrors;
+
+      let order = linkage.collate(processing, roots, shuntID);
+
+      let names = new Set();
+      for (let i = 0, n = order.length; i < n; ++i) {
+        let item = order[i];
+        let err = linkage.validate(item, names);
+        if (err) {
+          return DialectError.handleLinkValidationError(this, err, item.path);
+        }
+
+        item.module = emitter.prepareForOutput(item.parsed);
+        if (!item.reachable) {
+          if (item.path != shuntID || item.path != item.inferFileName()) {
+            item.module.addAttribute("path", item.path);
+          }
+        }
+      }
+
+      let text = emitter.textify(InputIR.FORM_TRIPLE);
+
+      this._log("writing " + fileName);
+      return this._system.write(fileName, text).then(() => (
+        Promise.resolve(fileName)
+      ));
+    });
+  }
+
+  _cueAsyncWorkOnInput(item, set, parser) {
+    // NB: This lets us avoid races, since 'read' is asynchronous.  Pay
+    // careful attention to effect that the set membership check has on
+    // timing!  And heed the name--resolution of the returned promise *only*
+    // guarantees that work is cued up--not that the given item's input is
+    // parsed and that the IR is available...
+    if (set.has(item)) {
+      return Promise.resolve();
+    }
+    set.add(item);
+
+    return this._system.read(item.path).catch((err) => {
+      if (err instanceof TripleKit.NoSuchFileError) {
+        err = new TripleKit.ImportError(item)
+      }
+      return Promise.reject(err);
+    }).then((contents) => {
+      try {
+        item.parsed = parser.ingestNormalText(contents);
+      } catch (ex) {
+        return Promise.reject(new CommonErrors.DialectError(item.path, ex));
+      }
+
+      return this._processDependencies(item, set, parser);
+    });
+  }
+
+  // NB: Context matters; both this method and `_cueAsyncWorkOnInput` exist
+  // *only* to make sure the module graph gets walked and the parser's results
+  // made available (as IR).  Any substantial work predicated on the the IR
+  // actually being ready for use should *not* happen here.  Instead, there is
+  // an opportune moment to do it after units have been collated (and are
+  // conveniently available deduplicated, in a list appearing in the exact
+  // same module order that will eventually be written as compilation text).
+  // So do it there, at the time when the input IR is converted to output IR.
+  _processDependencies(item, set, parser) {
+    let pending = [];
+
+    const { ImportError } = TripleKit;
+
+    let { imports } = item.parsed;
+    for (let i = 0, n = imports.length; i < n; ++i) {
+      let nu, twig = imports[i].path.value;
+      let importee = item.getRelated(twig);
+
+      if (PathResolver.isRelative(twig)) {
+        nu = this._cueAsyncWorkOnInput(importee, set, parser).catch((err) => {
+          if (err instanceof ImportError && err.importee == importee &&
+              err.importer == null) {
+            err.importer = item;
+          }
+          return Promise.reject(err);
+        });
+      } else {
+        nu = Promise.reject(new ImportError(importee, item));
+      }
+      pending.push(nu);
+
+      importee.reachable = true;
+      item.dependIDs.push(importee.path);
+      if (imports[i].name == item.link) {
+        item.priority = importee;
+      }
+    }
+
+    return Promise.all(pending);
+  }
+
+  ////////////////////////////////////////////////////////////////////////////
+
+  decompile(path, filters = null) {
+    const { DialectError } = CommonErrors;
+    const $err = (ex) => Promise.reject(new DialectError(path, ex));
+    return this._system.read(path).then((contents) => {
+      this._log("decompiling " + path);
+
+      let roots = [];
+      try {
+        let map = this._createNeonatalGroup(contents, roots);
+        var writable = this._resolveNodesAndPaths(map, roots, filters);
+      } catch (ex) {
+        return $err(ex);
+      }
+
+      if (filters && writable.length != filters.length) {
+        return $err(Error("Inextricable module(s)"));
+      }
+
+      return this._writeSourceFiles(writable);
+    });
+  }
+
+  _createNeonatalGroup(text, roots) {
+    const $err = (why) => (new CommonErrors.DialectError(null, why));
+    let result = new Map();
+
+    let parser = new RealParser();
+    let parsed = parser.ingestCompilationText(text);
+    for (let i = 0, n = parsed.length; i < n; ++i) {
+      let item = CompilerItem.from(parsed[i]);
+
+      // NB: Accessing `item.name` itself can throw, due to conflicts (i.e.
+      // errors) in the compilation text.  See `CompilerItem.resolveName`.
+      try {
+        if (result.has(item.name)) {
+          throw new ProgramLinkage.NameCollisionError(item);
+        }
+      } catch (ex) {
+        throw $err(ex);
+      }
+
+      result.set(item.name, item);
+      if (item.path != null) {
+        roots.push(item);
+      }
+    }
+
+    return result;
+  }
+
+  _resolveNodesAndPaths(map, roots, filters) {
+    const { DialectError } = CommonErrors;
+    const $err = (why) => (new DialectError(null, new Error(why)));
+    let emitter = new Emitter();
+    let result = [];
+
+    let stack = [ ...roots ];
+    let finished = new Set();
+
+    while (stack.length) {
+      let item = stack.pop();
+      let branch = item.path;
+      for (let i = 0, n = item.parsed.imports.length; i < n; ++i) {
+        let declaration = item.parsed.imports[i];
+        let twig = declaration.path.value;
+        let path = PathResolver.normalizePath(twig, branch);
+        let dependency = map.get(declaration.name);
+        if (dependency && dependency.path == null) {
+          dependency.path = path;
+          if (!finished.has(dependency)) {
+            stack.push(dependency);
+          }
+        } else if (!dependency || dependency.path != path) {
+          throw $err("Unresolvable module: " + declaration.name);
+        }
+      }
+
+      if (!filters || filters.indexOf(declaration.name) >= 0) {
+        item.module = emitter.prepareForOutput(item.parsed);
+        result.push(item);
+      }
+
+      finished.add(item);
+    }
+
+    if (map.size != finished.size) {
+      // XXX arguably not a dialect error?
+      throw $err("Unreachable module(s)");
+    }
+
+    return result;
+  }
+
+  _writeSourceFiles(items) {
+    let result = [], pending = [];
+
+    for (let i = 0, n = items.length; i < n; ++i) {
+      let { name, path, text } = items[i];
+      this._log("  module " + name + "...");
+      pending.push(this._system.write(path, text));
+      result.push(path);
+    }
+
+    return new Promise((resolve) =>
+      Promise.all(pending).then(() => resolve(result))
+    );
+  }
+
+  ////////////////////////////////////////////////////////////////////////////
+
+  publish(fileName) {
+    const { TBlock } = InputIR;
+    const { GBlock } = InputIR;
+
+    // TODO Make sure decompile and build constraints are enforced here, too.
+    return this._system.read(fileName).then((contents) => {
+      try {
+        var parsed = (new RealParser).ingestCompilationText(contents, GBlock);
+        var emitter = Emitter.from(parsed, TBlock);
+      } catch (ex) {
+        return Promise.reject(new CommonErrors.DialectError(fileName, ex));
+      }
+
+      let text = emitter.textify(InputIR.FORM_TRIPLE);
+
+      this._log("writing " + fileName);
+      return this._system.write(fileName, text).then(() => (
+        Promise.resolve(fileName)
+      ));
+    });
+  }
+
+  ////////////////////////////////////////////////////////////////////////////
+
+  createCredits(inputPath, outputPath = "credits.src") {
+    return this._system.read(inputPath).then((input) => {
+      try {
+        var output = AcknowledgeMint.process(input, inputPath);
+      } catch (ex) {
+        if (ex instanceof AcknowledgeMint.InputFormatError) {
+          ex.path = inputPath;
+        }
+        return Promise.reject(ex);
+      }
+
+      this._log("writing " + outputPath);
+      return this._system.write(outputPath, output);
+    });
+  }
+
+  ////////////////////////////////////////////////////////////////////////////
+
+  init(path) {
+    return this._system.write(path, this._system.identity);
+  }
+
+  ////////////////////////////////////////////////////////////////////////////
+
+  // Misc. utility methods; not necessarily a stable part of the interface
+  // (even if given names that suggest they are "public").
+
+  getProgramText(path) {
+    return this._system.read(path).then((contents) => {
+      return (new ProgramText(contents)).scanWhole();
+    });
+  }
+
+  _log(text) {
+    let { output } = this._system;
+    if (output) {
+      output.report(text);
+    }
+  }
+}
+
+TripleKit.NoSuchFileError = class NoSuchFileError extends Error {
+  constructor(path, message = "No such file") {
+    super(message);
+    this.path = path;
+  }
+}
+
+// NB: This is _not_ a general-purpose class for signalling problems with
+// imports.  It is specifically meant for imports that refer to  files that
+// don't exist.
+TripleKit.ImportError = class ImportError extends TripleKit.NoSuchFileError {
+  constructor(importee, importer = null) {
+    super(importee.path, "Invalid path");
+    this.importee = importee;
+    this.importer = importer;
+  }
+}
+
+TripleKit.NoFileSourceError = class NoFileSourceError extends Error {
+  constructor() {
+    super("No file source");
+  }
+}
+/// </script>
+/// <script>
+/// export
+class AcknowledgeMint {
+  static process(input) {
+    if (AcknowledgeMint.isValid(input)) {
+      return (
+        "export var credits =" + "\n" +
+        "` ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' '" +
+        " ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' '" + "\n" +
+        input + ((!input.endsWith("\n") && "\n") || "") +
+        "' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' '" +
+        " ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' `" + "\n"
+      );
+    }
+    throw new AcknowledgeMint.InputFormatError;
+  }
+
+  static isValid(text) {
+    return text.indexOf("`") < 0;
+  }
+}
+
+AcknowledgeMint.InputFormatError = class InputFormatError extends Error {
+  constructor(path = null) {
+    super("Invalid input");
+    this.path = path;
+  }
+}
+/// </script>
+/// <script>
+// NB: Although it currently does not, the module ErrorCommons is allowed to
+// depend on this module.  In order to avoid direct circular dependencies,
+// however, do not introduce any dependency in this module to ErrorCommons
+// (i.e. vice versa) by binding to it by name--whether by direct import or
+// not.  (If ever it becomes necessary to rely on some facility of the
+// ErrorCommons module here, consider instead introducing a `commons` argument
+// and passing ErrorCommons at the call site.)
+
+/// import { ProgramLinkage } from "./ProgramLinkage.src";
+
+// TODO Transplant more stuff into this module (currently too spread out).
+
+/// export ...
+class CommonErrors { };
+
+CommonErrors.DialectError = class DialectError extends Error {
+  constructor(path, inner = null) {
+    if (inner instanceof DialectError) {
+      return DialectError.fixUp(inner, path);
+    }
+
+    super("Malformed input");
+    this.path = path;
+    this.inner = inner;
+  }
+
+  static fixUp(instance, path) {
+    instance.path = path;
+    return instance;
+  }
+
+  static handleLinkValidationError(kit, err, path) {
+    const { MismatchError } = ProgramLinkage;
+    const { NameCollisionError } = ProgramLinkage;
+
+    if (err instanceof NameCollisionError) {
+      return Promise.reject(new DialectError(path, err));
+    } else if (err instanceof MismatchError) {
+      return kit.getProgramText(path).then((text) => {
+        err.generateDetails(text);
+      }).then(() => (
+        Promise.reject(new DialectError(path, err))
+      ));
+    }
+
+    return Promise.reject(err); // Shouldn't happen (indicates another error)
+  }
+}
+/// </script>
+/// <script>
+/// import { ErrorCommons } from "./ErrorCommons.src";
+
+/// export
+class ProgramLinkage {
+  constructor(itemCache) {
+    this._cache = itemCache;
+  }
+
+  // NB: this method mutates the input set.
+  collate(set, rootIDs, shuntID) {
+    // assert(set.size == this._cache.size)
+    let result = [];
+    let ids = [ ...rootIDs ];
+
+    while (ids.length) {
+      let item = this._cache.get(ids.shift());
+      if (set.has(item.priority)) {
+        ids.unshift(item.path);
+        ids.unshift(item.priority.path);
+        continue;
+      } else if (!set.has(item)) {
+        continue;
+      }
+      set.delete(item);
+
+      if (item.path == shuntID) {
+        var shunting = item;
+      } else {
+        result.push(item);
+      }
+
+      ids.unshift(...item.dependIDs);
+    }
+
+    result.push(shunting);
+
+    return result;
+  }
+
+  validate(item, names) {
+    const { MismatchError } = ProgramLinkage;
+    const { NameCollisionError} = ProgramLinkage;
+
+    if (names.has(item.name)) {
+      return new NameCollisionError(item);
+    }
+    names.add(item.name);
+
+    let { imports } = item.parsed;
+    for (let i = 0, n = imports.length; i < n; ++i) {
+      let dependency = item.getRelated(imports[i].path.value);
+      if (imports[i].name != dependency.name) {
+        return new MismatchError(item, imports[i]);
+      }
+    }
+    return null;
+  }
+}
+
+ProgramLinkage.MismatchError = class MismatchError extends Error {
+  constructor(item, declaration) {
+    const $quote = JSON.stringify;
+    super(
+      "Module export symbol differs from import " + $quote(declaration.name)
+    );
+    this.item = item;
+    this.declaration = declaration;
+    this.detail = null;
+  }
+
+  // TODO use the right token
+  generateDetails(programText, token = this.declaration.trigger) {
+    if (!this.detail) {
+      this.detail = ErrorCommons.makeSourceContextString(
+        this.message, programText, token
+      );
+    }
+    return this.detail;
+  }
+}
+
+ProgramLinkage.NameCollisionError = class NameCollisionError extends Error {
+  constructor(item) {
+    super("Name collision: " + item.name);
+    this.item = item;
+  }
+}
+/// </script>
+/// <script>
+/// import { ProgramText } from "./ProgramText.src";
+/// import { Token } from "./Token.src";
+/// import { TokenScanner } from "./TokenScanner.src";
+
+// TODO Transplant more stuff into this module (currently too spread out).
+
+/// export
+class ErrorCommons {
+  static createNoSuchFileMessage(ex) {
+    let feedback = ex.message + ": " + ex.path;
+    if (ex instanceof TripleKit.ImportError && ex.importer) {
+      feedback += " (for import found in " + ex.importer.path + ")";
+    }
+    return feedback;
+  }
+
+  static makeSourceContextString(preamble, program, token) {
+    let input = String(program);
+    let no = ProgramText.getLineNumber(token.position, program.lines);
+
+    let { start } = program.lines[no - 1];
+    let till = input.indexOf("\n", start);
+    if (input.charAt(till - 1) == "\r") {
+      --till;
+    }
+    let code = input.substring(start, till); // XXX
+
+    let where = token.position;
+    let marker = [];
+    for (let i = 0, n = where - start; i < n; ++i) {
+      marker.push("-");
+    }
+
+    return (
+      preamble + " (on line " + no + ")" + "\n\n" +
+      ">>> " + code + "\n" +
+      ">>> " + marker.join("") + "^"
+    );
+    // XXX line number placement is not ideal; check notes from the commit log
+  }
+
+  static createSyntaxErrorMessage(ex) {
+    let feedback = ex.message + " for " + ex.path;
+    if (ex.inner) {
+      if (("detail" in ex.inner) && (ex.inner.detail != null)) {
+        feedback += "\n\n" + ex.inner.detail;
+      } else {
+        feedback += "\n\n" + ex.inner.message;
+      }
+    }
+    return feedback;
+  }
+
+  static createBadTokenMessage(have, want, why = null) {
+    const { TokenHelper } = ErrorCommons;
+
+    let helper = new TokenHelper();
+    if (have == TokenScanner.ERROR) {
+      var feedback = why; // a specific scanner "ERROR_*" constant string
+    } else if (have == TokenScanner.EOF) {
+      var feedback = "Unexpected EOF";
+    } else {
+      var feedback = "Unexpected token: " + helper.describeToken(have);
+      // assert(want != null)
+    }
+    if (want) {
+      feedback += " (wanted " + helper.describeToken(want) + ")";
+    }
+
+    return feedback;
+  }
+}
+
+// For internal use only
+ErrorCommons.TokenHelper = class TokenHelper {
+  constructor(map = null) {
+    if (!map) map = TokenScanner.addKeywords(new Map);
+
+    this.kindToKeywordMap = new Map();
+    for (let [ content, token ] of map) {
+      this.kindToKeywordMap.set(token, content);
+    }
+  }
+
+  describeToken(which) {
+    switch (which) {
+      case Token.IDENTIFIER_NAME: return "identifier";
+      case Token.NUMBER_LITERAL: return "number";
+      case Token.STRING_LITERAL: return "string";
+      case Token.TAGGABLE_TEMPLATE: return "taggable";
+      case Token.PATTERN_LITERAL: return "pattern";
+      case Token.ATTRIBUTE_NAME: return "attribute";
+      case Token.OPEN_DELIMITER: return "open delimiter";
+      case Token.CLOSE_DELIMITER: return "open delimiter";
+      case Token.WHITESPACE: return "whitespace";
+      case Token.COMMENT: return "comment";
+      default:
+        if (0x20 <= which && which < 0x7F) {
+          return "\"" + String.fromCharCode(which) + "\"";
+        } else if (which > 0) {
+          let keyword = this.kindToKeywordMap.get(which);
+          if (keyword) {
+            return "\"" + keyword + "\"";
+          }
+        }
+      break;
+    }
+    throw new Error("Unknown token (" + which + ")");
+  }
+}
+/// </script>
+/// <script>
+/// import { Token } from "./Token.src";
+
+// "Program" as used here is _not_ used in the same sense as the parser's
+// "compilation text"; the text in question here need not be a full program--
+// it might, for example, be the text of a single module.
+//
+// NB: Although we pretend to be a string, the value proposition for this
+// module is the extra work it's able to do.  Some of that work is
+// intrinsically associated with self-mutating side effects that occur as
+// outside code scans over its contents.  Namely, info about line splits is
+// generated during this process, so if consumers exhibit patterns of random
+// access (skipping forward over runs of text), then accurate info is not
+// guaranteed to be available.  Refer to the behavior of `charCodeAt` below.
+// Additionally, the only way to obtain line split info for the entirety of
+// the input is to ensure the entire contents have been scanned from beginnig
+// to end (unless the caller has an oracle that can provide a monotonically
+// increasing sequence of the offsets for line splits, in which case, you
+// don't have any real need for this class in the first place).
+
+/// export
+class ProgramText extends String {
+  constructor(content, onlinestart = null) {
+    super(content);
+
+    this.onlinestart = onlinestart;
+
+    this._edge = -1;
+    this.lines = [];
+    if (content.length) {
+      this.lines.push(new ProgramText.LineInfo());
+    }
+  }
+
+  // NB: This is a potentially expensive-ish operation, due to allocations and
+  // other consequences of the side effects described above.  (Really only
+  // added for use by error-handling logic outside of the hot paths.)
+  scanWhole() {
+    for (let i = this._edge + 1, n = this.length; i < n; ++i) {
+      this.charCodeAt(i);
+    }
+    return this;
+  }
+
+  charCodeAt(where) {
+    const { CARRIAGE_RETURN } = ProgramText;
+    const { LINE_FEED } = ProgramText;
+    let result = this._peek(where);
+    if (where > this._edge) {
+      if (result == CARRIAGE_RETURN && this._peek(where + 1) == LINE_FEED) {
+        this._recordLineSequence("\r\n", where);
+      } else if (result == LINE_FEED) {
+        this._recordLineSequence("\n", where);
+      }
+      this._edge = where;
+    }
+    return result;
+  }
+
+  _peek(where) {
+    return super.charCodeAt(where);
+  }
+
+  _recordLineSequence(content, where) {
+    let token = new Token(Token.WHITESPACE, where, content);
+    let info = new ProgramText.LineInfo(token);
+    this._dispatch(this.onlinestart, info);
+    this.lines.push(info);
+  }
+
+  _dispatch(handler, ...args) {
+    if (handler) handler.apply(null, args);
+  }
+
+  static getLineConvention(sequence) {
+    if (sequence == "\n") return ProgramText.UNIX_STYLE;
+    if (sequence == "\r\n") return ProgramText.DOS_STYLE;
+    return ProgramText.UNKNOWN_STYLE;
+  }
+
+  // NB: This uses 1-based indexing (and uses -1 to indicate failure).
+  static getLineNumber(position, lines) {
+    // General expectation is that in the common case `where` is current token
+    // position, which is why we're not using binary search--because it would
+    // be slower than our linear search from the end; since our line offsets
+    // are lazily discovered as the scanner reads the program text, we should
+    // be almost always returning the line from the end of the list, unless
+    // the caller is doing something really weird...
+    for (let i = lines.length - 1; i >= 0; --i) {
+      if (lines[i].start <= position) {
+        return i + 1;
+      }
+    }
+    return -1;
+  }
+}
+
+// NB: Order matters; valid line endings (LF and CRLF) *MUST* be detectable
+// using `ProgramText.getLineConvention` with the idiom
+//
+//     r >= UNIX_STYLE
+//
+// ... where `r` is the return value.
+ProgramText.UNKNOWN_STYLE = -2;
+ProgramText.MIXED_STYLE = -1;
+ProgramText.UNIX_STYLE = 0;
+ProgramText.DOS_STYLE = 1;
+
+ProgramText.CARRIAGE_RETURN = 0x0D;
+ProgramText.LINE_FEED = 0x0A;
+
+ProgramText.LineInfo = class LineInfo {
+  constructor(token = null) {
+    if (token) {
+      // assert(ProgramText.getConvention(token.content) >= 0)
+      this.start = token.position + token.content.length;
+      this.token = token;
+    } else {
+      this.start = 0;
+      this.token = null;
+    }
+  }
+}
+/// </script>
+/// <script>
+/// export
+class Token {
+  constructor(kind, position, content) {
+    this.kind = kind;
+    this.position = position;
+    this.content = content;
+  }
+}
+
+// NB: The constants here are carefully chosen not to overlap with the value
+// of any printable ASCII character or NUL.
+Token.IDENTIFIER_NAME = -1;
+Token.NUMBER_LITERAL = -2;
+Token.STRING_LITERAL = -3;
+Token.TAGGABLE_TEMPLATE = -4;
+Token.PATTERN_LITERAL = -5;
+Token.ATTRIBUTE_NAME = -6;
+
+Token.OPEN_DELIMITER = -10;
+Token.CLOSE_DELIMITER = -11;
+
+Token.WHITESPACE = -20;
+Token.COMMENT = -21;
+
+Token.UNEXPECTED_JUNK = -99;
+
+// NB: Single-character tokens' discriminants overlap with the ASCII value.
+// This allows us to get some extra mileage out of these definitions so they
+// can also be used for internal character matching during scanning.
+Token.AMPERSAND = 0x26;
+Token.ASTERISK = 0x2A;
+Token.BANG = 0x21;
+Token.BAR = 0x7C;
+Token.CARET = 0x5E;
+Token.CLOSE_CURLY = 0x7D;
+Token.CLOSE_PAREN = 0x29;
+Token.CLOSE_SQUARE = 0x5D;
+Token.COLON = 0x3A;
+Token.COMMA = 0x2C;
+Token.EQUAL = 0x3D;
+Token.GREATER_THAN = 0x3E;
+Token.LESS_THAN = 0x3C;
+Token.MINUS = 0x2D;
+Token.OPEN_CURLY = 0x7B;
+Token.OPEN_PAREN = 0x28;
+Token.OPEN_SQUARE = 0x5B;
+Token.PERCENT = 0x25;
+Token.PERIOD = 0x2E;
+Token.PLUS = 0x2B;
+Token.QUESTION_MARK = 0x3F;
+Token.SEMICOLON = 0x3B;
+Token.SLASH = 0x2F;
+Token.TILDE = 0x7E;
+
+// Multi-character, non-keyword symbols
+Token.AMPERSAND_EQUAL = 151;
+Token.AND = 152;
+Token.ARROW = 153;
+Token.ASTERISK_EQUAL = 173;
+Token.BAR_EQUAL = 154;
+Token.CARET_EQUAL = 155;
+Token.DOT_DOT_DOT = 156;
+Token.DOUBLE_EQUALS = 157;
+Token.GREATER_OR_EQUAL = 158;
+Token.LEFT_SHIFT = 159;
+Token.LEFT_SHIFT_EQUAL = 160;
+Token.LESS_OR_EQUAL = 161;
+Token.MINUS_EQUAL = 162;
+Token.MINUS_MINUS = 163;
+Token.NOT_EQUAL = 164;
+Token.NOT_STRICTLY_EQUAL = 165;
+Token.OR = 166;
+Token.PERCENT_EQUAL = 167;
+Token.PLUS_EQUAL = 168;
+Token.PLUS_PLUS = 169;
+Token.RIGHT_SHIFT = 170;
+Token.RIGHT_SHIFT_EQUAL = 171;
+Token.SLASH_EQUAL = 172;
+Token.TRIPLE_EQUALS = 176;
+Token.UNSIGNED_RIGHT_SHIFT = 177;
+Token.UNSIGNED_RIGHT_SHIFT_EQUAL = 178;
+
+// Reserved words
+Token.ASYNC = 201;
+Token.AWAIT = 202;
+Token.BREAK = 203;
+Token.CASE = 204;
+Token.CATCH = 205;
+Token.CLASS = 206;
+Token.CONST = 207;
+Token.CONTINUE = 208;
+Token.DEBUGGER = 209;
+Token.DEFAULT = 210;
+Token.DELETE = 211;
+Token.DO = 212;
+Token.ELSE = 213;
+Token.ENUM = 214;
+Token.EXPORT = 215;
+Token.EXTENDS = 216;
+Token.FALSE = 217;
+Token.FINALLY = 218;
+Token.FOR = 219;
+Token.FROM = 220;
+Token.FUNCTION = 221;
+Token.IF = 222;
+Token.IMPLEMENTS = 223;
+Token.IMPORT = 224;
+Token.IN = 225;
+Token.INSTANCEOF = 226;
+Token.INTERFACE = 227;
+Token.LET = 228;
+Token.NEW = 229;
+Token.NULL = 230;
+Token.PACKAGE = 231;
+Token.PRIVATE = 232;
+Token.PROTECTED = 233;
+Token.PUBLIC = 234;
+Token.RETURN = 235;
+Token.SUPER = 236;
+Token.SWITCH = 237;
+Token.THIS = 238;
+Token.THROW = 239;
+Token.TRUE = 240;
+Token.TRY = 241;
+Token.TYPEOF = 242;
+Token.UNDEFINED = 243;
+Token.VAR = 244;
+Token.VOID = 245;
+Token.WHILE = 246;
+Token.WITH = 247;
+Token.YIELD = 248;
+/// </script>
+/// <script>
+/// import { Token } from "./Token.src";
+
+/// export
+class TokenScanner {
+  // To understand the scanner implementation, it's a good idea to internalize
+  // these three essential primitives that are used throughout:
+  //
+  // - tip
+  //   The character at the scanner's current position
+  // - move
+  //   Same as next, but returns old tip while advancing the position
+  // - next
+  //   Same as move, but returns new tip while advancing the position
+  //
+  // Less commonly used:
+  // - match
+  //   A conditional move iff the tip matches; this advances the scanner, and
+  //   the return value indicates which move occurred (null means no match)
+  // - peek
+  //   Looks ahead (by default) one character (not at the tip; the one
+  //   *after*), without advancing; otherwise looks at the given position
+  //
+  // For the scanner's findings:
+  // - emit
+  //   Dispatches the ontoken callback
+  // - eject
+  //   Like emit, but for errors (dispatching onerror)
+  //
+  // Consumers can also use the return value from `readNextToken` for inline
+  // monitoring.  (We eschew with creating `Token` objects ourselves to try
+  // keeping GC churn rate low.  This may be a case of premature optimization,
+  // but in any case we're still left with a pretty clean design overall.)
+  constructor(text, onemit = null, oneject = null) {
+    this.text = text;
+    this.ontoken = onemit;
+    this.onerror = oneject;
+
+    this.oncomment = null;
+
+    this.keepComments = false;
+    this.keepWhitespace = false;
+
+    this._characterCode = null;
+    this._patternStart = null;
+
+    this.keywords = TokenScanner.addKeywords(new Map);
+
+    this.position = null;
+    this.reseat(0);
+  }
+
+  static addKeywords(map) {
+    const $ = (kind, word) => void(map.set(word, kind));
+
+    $(Token.ASYNC, "async");
+    $(Token.AWAIT, "await");
+    $(Token.BREAK, "break");
+    $(Token.CASE, "case");
+    $(Token.CATCH, "catch");
+    $(Token.CLASS, "class");
+    $(Token.CONST, "const");
+    $(Token.CONTINUE, "continue");
+    $(Token.DEBUGGER, "debugger");
+    $(Token.DEFAULT, "default");
+    $(Token.DELETE, "delete");
+    $(Token.DO, "do");
+    $(Token.ELSE, "else");
+    $(Token.ENUM, "enum");
+    $(Token.EXPORT, "export");
+    $(Token.EXTENDS, "extends");
+    $(Token.FALSE, "false");
+    $(Token.FINALLY, "finally");
+    $(Token.FOR, "for");
+    $(Token.FROM, "from");
+    $(Token.FUNCTION, "function");
+    $(Token.IF, "if");
+    $(Token.IMPLEMENTS, "implements");
+    $(Token.IMPORT, "import");
+    $(Token.IN, "in");
+    $(Token.INSTANCEOF, "instanceof");
+    $(Token.INTERFACE, "interface");
+    $(Token.LET, "let");
+    $(Token.NEW, "new");
+    $(Token.NULL, "null");
+    $(Token.PACKAGE, "package");
+    $(Token.PRIVATE, "private");
+    $(Token.PROTECTED, "protected");
+    $(Token.PUBLIC, "public");
+    $(Token.RETURN, "return");
+    $(Token.SUPER, "super");
+    $(Token.SWITCH, "switch");
+    $(Token.THIS, "this");
+    $(Token.THROW, "throw");
+    $(Token.TRUE, "true");
+    $(Token.TRY, "try");
+    $(Token.TYPEOF, "typeof");
+    $(Token.UNDEFINED, "undefined");
+    $(Token.VAR, "var");
+    $(Token.VOID, "void");
+    $(Token.WHILE, "while");
+    $(Token.WITH, "with");
+    $(Token.YIELD, "yield");
+
+    return map;
+  }
+
+  reseat(value) {
+    this.position = value;
+    this._characterCode = (this.position < this.text.length) ?
+      this.text.charCodeAt(this.position) :
+      null;
+  }
+
+  get tip() {
+    return this._characterCode;
+  }
+
+  _dispatch(handler, ...args) {
+    if (handler) handler.apply(null, args);
+  }
+
+  readNextToken(keepWhitespace = this.keepWhitespace) {
+    try {
+      var where = this._skipWhitespace(keepWhitespace);
+    } catch (ex) {
+      return TokenScanner.UrgentError.handle(ex);
+    }
+
+    if (keepWhitespace && where >= 0) {
+      return this._emit(Token.WHITESPACE, where);
+    }
+
+    // NB: ontoken not dispatched for EOF.
+    if (!this.tip) return null;
+
+    let start = this.position;
+    let code = this._move();
+
+    switch (code) {
+      case Token.CLOSE_CURLY:
+      case Token.CLOSE_PAREN:
+      case Token.CLOSE_SQUARE:
+      case Token.COLON:
+      case Token.COMMA:
+      case Token.OPEN_CURLY:
+      case Token.OPEN_SQUARE:
+      case Token.QUESTION_MARK:
+      case Token.SEMICOLON:
+      case Token.TILDE:
+        return this._emit(code, start);
+      break;
+      case Token.AMPERSAND:
+        if (this._match(Token.AMPERSAND)) {
+          return this._emit(Token.AND, start);
+        } else if (this._match(Token.EQUAL)) {
+          return this._emit(Token.AMPERSAND_EQUAL, start);
+        }
+        return this._emit(Token.AMPERSAND, start);
+      case Token.ASTERISK:
+        if (this._match(Token.EQUAL)) {
+          return this._emit(Token.ASTERISK_EQUAL, start);
+        }
+        return this._emit(Token.ASTERISK, start);
+      case Token.BANG:
+        if (this._match(Token.EQUAL)) {
+          if (this._match(Token.EQUAL)) {
+            return this._emit(Token.NOT_STRICTLY_EQUAL, start);
+          }
+          return this._emit(Token.NOT_EQUAL, start);
+        }
+        return this._emit(Token.BANG, start);
+      case Token.BAR:
+        if (this._match(Token.BAR)) {
+          return this._emit(Token.OR, start);
+        } else if (this._match(Token.EQUAL)) {
+          return this._emit(Token.BAR_EQUAL, start);
+        }
+        return this._emit(Token.BAR, start);
+      case Token.CARET:
+        if (this._match(Token.EQUAL)) {
+          return this._emit(Token.CARET_EQUAL, start);
+        }
+        return this._emit(Token.CARET, start);
+      case Token.EQUAL:
+        if (this._match(Token.EQUAL)) {
+          if (this._match(Token.EQUAL)) {
+            return this._emit(Token.TRIPLE_EQUALS, start);
+          }
+          return this._emit(Token.DOUBLE_EQUALS, start);
+        } else if (this._match(Token.GREATER_THAN)) {
+          return this._emit(Token.ARROW, start);
+        }
+        return this._emit(Token.EQUAL, start);
+      case Token.GREATER_THAN:
+        if (this._match(Token.EQUAL)) {
+          return this._emit(Token.GREATER_OR_EQUAL, start);
+        } else if (this._match(Token.GREATER_THAN)) {
+          if (this._match(Token.EQUAL)) {
+            return this._emit(Token.RIGHT_SHIFT_EQUAL, start);
+          } else if (this._match(Token.GREATER_THAN)) {
+            if (this._match(Token.EQUAL)) {
+              return this._emit(Token.UNSIGNED_RIGHT_SHIFT_EQUAL, start);
+            }
+            return this._emit(Token.UNSIGNED_RIGHT_SHIFT, start);
+          }
+          return this._emit(Token.RIGHT_SHIFT, start);
+        }
+        return this._emit(Token.GREATER_THAN, start);
+      case Token.LESS_THAN:
+        if (this._match(Token.EQUAL)) {
+          return this._emit(Token.LESS_OR_EQUAL, start);
+        } else if (this._match(Token.LESS_THAN)) {
+          if (this._match(Token.EQUAL)) {
+            return this._emit(Token.LEFT_SHIFT_EQUAL, start);
+          }
+          return this._emit(Token.LEFT_SHIFT, start);
+        }
+        return this._emit(Token.LESS_THAN, start);
+      case Token.MINUS:
+        if (this._match(Token.EQUAL)) {
+          return this._emit(Token.MINUS_EQUAL, start);
+        } else if (this._match(Token.MINUS)) {
+          return this._emit(Token.MINUS_MINUS, start);
+        }
+        return this._emit(Token.MINUS, start);
+      case Token.OPEN_PAREN:
+        // XXX Temporary hack to permit some PCRE-like literals while keeping
+        // the lexer-to-parser relationship acyclical (i.e., there is no need
+        // for feedback propagation from parser to scanner, e.g. by putting
+        // the scanner into a different mode allowing patterns).  Under our
+        // hacky scheme, pattern literals are permitted iff using parens.
+        if (this.tip == Token.SLASH) {
+          this._patternStart = this.position;
+        }
+        return this._emit(Token.OPEN_PAREN, start);
+      case Token.PERCENT:
+        if (this._match(Token.EQUAL)) {
+          return this._emit(Token.PERCENT_EQUAL, start);
+        }
+        return this._emit(Token.PERCENT, start);
+      case Token.PERIOD:
+        if (this._peek(Token.PERIOD) && this._match(Token.PERIOD)) {
+          this._next();
+          return this._emit(Token.DOT_DOT_DOT, start);
+        }
+        return this._emit(Token.PERIOD, start);
+      case Token.PLUS:
+        if (this._match(Token.EQUAL)) {
+          return this._emit(Token.PLUS_EQUAL, start);
+        } else if (this._match(Token.PLUS)) {
+          return this._emit(Token.PLUS_PLUS, start);
+        }
+        return this._emit(Token.PLUS, start);
+      case Token.SLASH:
+        if (this._patternStart != null) {
+          return this._scanPattern(start);
+        } else if (this._match(Token.SLASH)) {
+          if ((this._match(Token.SLASH) ||
+               this._match(Token.QUESTION_MARK)) &&
+               !this._match(Token.SLASH)) {
+            return this._scanTripleSlashEntity(start);
+          }
+          this._skipSingleLineComment(start);
+          return this._emit(Token.COMMENT, start, this.position);
+        } else if (this._match(Token.ASTERISK)) {
+          try {
+            this._skipMultiLineComment(start);
+          } catch (ex) {
+            return TokenScanner.UrgentError.handle(ex);
+          }
+          return this._emit(Token.COMMENT, start, this.position);
+        }
+        return this._emit(Token.SLASH, start);
+      case TokenScanner.BACKTICK:
+        return this._scanTaggableThing(start);
+      case TokenScanner.DOUBLE_QUOTE:
+      case TokenScanner.SINGLE_QUOTE:
+        return this._scanStringLiteral(start);
+      default:
+        if (TokenScanner.isIdentifierStart(code)) {
+          return this._scanWord(start);
+        } else if (TokenScanner.isDecimalDigit(code)) {
+          return this._scanNumber(start);
+        }
+      break;
+    }
+
+    return this._eject(TokenScanner.ERROR_UNRECOGNIZED_TOKEN, start);
+  }
+
+  _skipWhitespace(atomicLinebreak = false, keepComments = this.keepComments) {
+    // TODO dispatch onlineterminator
+    let where = this.position;
+    while (this.tip) {
+      let start = this.position;
+      if (TokenScanner.isLineTerminator(this.tip)) {
+        this._match(TokenScanner.CARRIAGE_RETURN);
+        if (!this._match(TokenScanner.LINE_FEED)) {
+          // XXX what can we do..?
+        }
+        if (atomicLinebreak) break;
+      } else {
+        while (TokenScanner.isWhitespace(this.tip, true)) {
+          this._next();
+        }
+      }
+      if (!keepComments) {
+        while (this._skipPossibleComment()) { };
+      }
+      if (this.position == start) {
+        break;
+      }
+    }
+
+    if (this.position != where) {
+      return where;
+    }
+    return -1;
+  }
+
+  static isWhitespace(code, inlineOnly = false) {
+    return (
+      code == TokenScanner.SPACE ||
+      code == TokenScanner.TAB ||
+      (!inlineOnly && TokenScanner.isLineTerminator(code))
+    );
+  }
+
+  static isLineTerminator(code) {
+    return (
+      code == TokenScanner.LINE_FEED || code == TokenScanner.CARRIAGE_RETURN
+    );
+  }
+
+  _skipPossibleComment() {
+    // NB: Triple slash delimiters are *NOT* considered comments.
+    let start = this.position;
+    if (this._match(Token.SLASH)) {
+      switch (this.tip) {
+        case Token.SLASH:
+          if (!this._peek(Token.QUESTION_MARK) &&
+              this._next() != Token.SLASH) {
+            return this._skipSingleLineComment(start), true;
+          }
+        break;
+        case Token.ASTERISK:
+          return this._skipMultiLineComment(start), true;
+        break;
+      }
+      this.reseat(start);
+    }
+    return false;
+  }
+
+  _move() {
+    let result = this.tip;
+    this.reseat(this.position + 1);
+    return result;
+  }
+
+  _next() {
+    this.reseat(this.position + 1);
+    return this.tip;
+  }
+
+  _match(which) {
+    if (this.tip == which) {
+      return this._move();
+    }
+    return null;
+  }
+
+  _peek(which, position = this.position + 1) {
+    return this.text.charCodeAt(position) == which;
+  }
+
+  _skipSingleLineComment(from) {
+    // NB: Entry into his method is permitted from any position, so long as
+    // the correct offset where the comment starts is passed in.
+    this.reseat(from + ("//").length);
+    while (this.tip && !TokenScanner.isLineTerminator(this.tip)) {
+      this._next();
+    }
+    this._dispatch(this.oncomment, from, this.position, this);
+  }
+
+  // NB: This can throw a `TokenScanner.UrgentError`, which should be caught
+  // and handled somewhere up the stack.
+  _skipMultiLineComment(from) {
+    // NB: Entry into his method is permitted from any position, so long as
+    // the correct offset where the comment starts is passed in.
+    let finished = false;
+    this.reseat(from + ("/*").length);
+    while (this.tip) {
+      if (this._match(Token.ASTERISK)) {
+        if (this._match(Token.SLASH)) {
+          finished = true;
+          break;
+        }
+      } else {
+        this._next();
+      }
+    }
+
+    if (!finished) {
+      throw new TokenScanner.UrgentError(
+        this._eject.bind(this), TokenScanner.ERROR_COMMENT_ABRUPT_END, from
+      );
+    }
+
+    this._dispatch(this.oncomment, from, this.position, this);
+  }
+
+  _emit(kind, begin, end = this.position) {
+    this._dispatch(this.ontoken, kind, begin, end, this.text, this);
+    return kind;
+  }
+
+  _eject(which, where) {
+    this._dispatch(this.onerror, which, where, this);
+    return TokenScanner.ERROR;
+  }
+
+  _scanStringLiteral(offset) {
+    let terminator = this.text.charCodeAt(offset);
+    let reason = this._skipStringContents(terminator);
+    if (!reason) {
+      return this._emit(Token.STRING_LITERAL, offset, this.position);
+    }
+    return this._eject(reason, offset);
+  }
+
+  _skipStringContents(terminator) {
+    while (!this._match(terminator)) {
+      if (TokenScanner.isLineTerminator(this.tip) || !this.tip) {
+        return TokenScanner.ERROR_STRING_ABRUPT_END;
+      } else if (this._move() == TokenScanner.BACKSLASH &&
+                 !this._skipStringEscapeSequence()) {
+        return TokenScanner.ERROR_INVALID_STRING_ESCAPE;
+      }
+    }
+
+    return null;
+  }
+
+  _scanTaggableThing(offset) {
+    let reason = null;
+    do {
+      switch (this._move()) {
+        case TokenScanner.BACKSLASH:
+          if (!this._skipStringEscapeSequence()) {
+            reason = TokenScanner.ERROR_INVALID_STRING_ESCAPE; // XXX "string"
+          }
+        break;
+        case TokenScanner.DOLLAR_SIGN:
+          if (this._match(Token.OPEN_CURLY)) {
+            let terminator; // TODO moar
+            if (this._match(TokenScanner.SINGLE_QUOTE)) {
+              terminator = TokenScanner.SINGLE_QUOTE;
+            } else if (this._match(TokenScanner.DOUBLE_QUOTE)) {
+              terminator = TokenScanner.DOUBLE_QUOTE;
+            } else {
+              reason = TokenScanner.ERROR_MALFORMED_TEMPLATE_CONTENT;
+            }
+
+            if (terminator) {
+              reason = this._skipStringContents(terminator);
+              if (!reason && !this._match(Token.CLOSE_CURLY)) {
+                reason = TokenScanner.ERROR_MALFORMED_TEMPLATE_CONTENT;
+              }
+            }
+          }
+        break;
+        case TokenScanner.EOF:
+          reason = TokenScanner.ERROR_TEMPLATE_ABRUPT_END;
+        break;
+        case TokenScanner.BACKTICK:
+          return this._emit(Token.TAGGABLE_TEMPLATE, offset, this.position);
+        break;
+      }
+    } while (!reason);
+
+    return this._eject(reason, offset);
+  }
+
+  // NB: We do not emit or eject here; we just return a boolean indicating
+  // validity.
+  _skipStringEscapeSequence() {
+    switch (this.tip) {
+      case TokenScanner.CARRIAGE_RETURN:
+        this._move() && this._match(TokenScanner.LINE_FEED);
+      return true;
+
+      case TokenScanner.LINE_FEED:
+      // -
+      case TokenScanner.BACKSLASH:
+      case TokenScanner.BACKTICK:
+      case TokenScanner.DOUBLE_QUOTE:
+      case TokenScanner.SINGLE_QUOTE:
+      // -
+      case TokenScanner.LOWER_N:
+      case TokenScanner.LOWER_R:
+      case TokenScanner.LOWER_T:
+      case TokenScanner.DIGIT_0:
+        this._next();
+      return true;
+
+      default:
+        if (this._match(TokenScanner.LOWER_X)) {
+          return this._matchHexDigit(true) && this._matchHexDigit(true);
+        } else if (this._match(TokenScanner.LOWER_U)) {
+          if (this._match(Token.OPEN_CURLY)) {
+            while (TokenScanner.isHexDigit(this.tip, true)) {
+              this._next();
+            }
+            return this._match(Token.CLOSE_CURLY);
+          } else {
+            return (
+              this._matchHexDigit(true) && this._matchHexDigit(true) &&
+              this._matchHexDigit(true) && this._matchHexDigit(true)
+            );
+          }
+        }
+      break;
+    }
+
+    return false;
+  }
+
+  _matchHexDigit(anyCase) {
+    if (TokenScanner.isHexDigit(this.tip, anyCase)) {
+      this._next();
+      return true;
+    }
+    return false;
+  }
+
+  _scanTripleSlashEntity(offset) {
+    let isGStyle = this._peek(Token.QUESTION_MARK, this.position - 1);
+    if (this._match(TokenScanner.SPACE)) {
+      if (this._match(Token.LESS_THAN)) {
+        let kind = (this._match(Token.SLASH)) ?
+          Token.CLOSE_DELIMITER :
+          Token.OPEN_DELIMITER;
+        if (this._match(TokenScanner.LOWER_S) &&
+            this._match(TokenScanner.LOWER_C) &&
+            this._match(TokenScanner.LOWER_R) &&
+            this._match(TokenScanner.LOWER_I) &&
+            this._match(TokenScanner.LOWER_P) &&
+            this._match(TokenScanner.LOWER_T) &&
+            this._match(Token.GREATER_THAN)) {
+          return this._emit(kind, offset, this.position);
+        }
+      } else if (TokenScanner.isIdentifierStart(this.tip) && !isGStyle) {
+        let nameStart = this.position;
+        do {
+          this._move();
+        } while (TokenScanner.isIdentifierPart(this.tip));
+
+        if (this._hasAttributeMarkers(nameStart)) {
+          return this._emit(Token.ATTRIBUTE_NAME, offset);
+        }
+
+        let kind = this._mapTextExtractionToKeywordDiscriminant(nameStart);
+        if (kind == Token.IMPORT || kind == Token.EXPORT) {
+          return this._emit(kind, offset);
+        }
+      }
+    }
+
+    return this._eject(TokenScanner.ERROR_INVALID_TRIPLE_SLASH, offset);
+  }
+
+  // NB: returns undefined if not a keyword
+  _mapTextExtractionToKeywordDiscriminant(begin, end = this.position) {
+    return this.keywords.get(this.text.substring(begin, end));
+  }
+
+  _hasAttributeMarkers(begin, end = this.position) {
+    const $isMark = (at) => (this._peek(TokenScanner.DOLLAR_SIGN, at));
+    return $isMark(begin) && (end - begin > 2) && $isMark(end - 1);
+  }
+
+  _scanPattern(offset) {
+    while (this.tip) {
+      if (this._match(Token.SLASH)) {
+        while (TokenScanner.LOWER_A <= this.tip &&
+               this.tip <= TokenScanner.LOWER_Z) {
+          this._next();
+        }
+        break;
+      } else if (TokenScanner.isLineTerminator(this.tip)) {
+        return this._eject(TokenScanner.ERROR_INCOMPLETE_PATTERN, offset);
+      }
+      this._next();
+    }
+
+    this._patternStart = null;
+    return this._emit(Token.PATTERN_LITERAL, offset);
+  }
+
+  _scanWord(offset) {
+    // TODO Allow Unicode escape sequences in identifiers?  (But not for
+    // keywords.)
+    while (TokenScanner.isIdentifierPart(this.tip)) {
+      this._move();
+    }
+
+    if (this._hasAttributeMarkers(offset)) {
+      return this._emit(Token.ATTRIBUTE_NAME, offset);
+    }
+
+    // TODO Optimize this?
+    let kind = this._mapTextExtractionToKeywordDiscriminant(offset);
+    return this._emit(kind || Token.IDENTIFIER_NAME, offset, this.position);
+  }
+
+  static isIdentifierStart(code) {
+    return (
+      (TokenScanner.UPPER_A <= code && code <= TokenScanner.UPPER_Z) ||
+      (TokenScanner.LOWER_A <= code && code <= TokenScanner.LOWER_Z) ||
+      code == TokenScanner.UNDERSCORE || code == TokenScanner.DOLLAR_SIGN
+    );
+    // TODO Unicode
+  }
+
+  static isIdentifierPart(code) {
+    return (
+      TokenScanner.isIdentifierStart(code) ||
+      TokenScanner.isDecimalDigit(code)
+    );
+    // TODO Unicode
+  }
+
+  static isDecimalDigit(code) {
+    return TokenScanner.DIGIT_0 <= code && code <= TokenScanner.DIGIT_9;
+  }
+
+  _scanNumber(offset) {
+    let hasLeadingZero = this._peek(TokenScanner.DIGIT_0, offset);
+    // TODO dispatch onnumbercharacter
+    if (hasLeadingZero && this._match(TokenScanner.LOWER_X)) {
+      let mark = this.position;
+      if (TokenScanner.isHexDigit(this.tip)) {
+        do {
+          this._next();
+        } while (TokenScanner.isHexDigit(this.tip));
+      } else {
+        return this._eject(TokenScanner.ERROR_HEXADECIMAL_DIGIT_EXPECTED);
+      }
+
+      let width = this.position - mark;
+      if (width == 2 || width == 4 || width == 8) {
+        return this._emit(Token.NUMBER_LITERAL, offset);
+      }
+    } else {
+      if (TokenScanner.isDecimalDigit(this.tip)) {
+        if (hasLeadingZero) {
+          return this._eject(TokenScanner.ERROR_INVALID_NUMBER_LITERAL, offset);
+        }
+
+        do {
+          this._next();
+        } while (TokenScanner.isDecimalDigit(this.tip));
+      }
+
+      if (this._match(Token.PERIOD)) {
+        if (TokenScanner.isDecimalDigit(this.tip)) {
+          do {
+            this._next();
+          } while (TokenScanner.isDecimalDigit(this.tip));
+        } else {
+          return this._eject(TokenScanner.ERROR_DECIMAL_DIGIT_EXPECTED);
+        }
+      }
+      if (this._match(TokenScanner.LOWER_E)) {
+        if (this.tip == Token.PLUS || this.tip == Token.MINUS) {
+          this._next();
+        }
+        if (TokenScanner.isDecimalDigit(this.tip)) {
+          do {
+            this._next();
+          } while (TokenScanner.isDecimalDigit(this.tip));
+        } else {
+          return this._eject(TokenScanner.ERROR_DECIMAL_DIGIT_EXPECTED);
+        }
+      }
+
+      return this._emit(Token.NUMBER_LITERAL, offset);
+    }
+
+    return this._eject(TokenScanner.ERROR_INVALID_NUMBER_LITERAL, offset);
+  }
+
+  static isHexDigit(code, anyCase = false) {
+    const ASCII = TokenScanner;
+    return (
+      (ASCII.DIGIT_0 <= code && code <= ASCII.DIGIT_9) ||
+      (ASCII.UPPER_A <= code && code <= ASCII.UPPER_F) ||
+      (ASCII.LOWER_A <= code && code <= ASCII.LOWER_F && anyCase)
+    );
+  }
+}
+
+TokenScanner.ERROR = 0;
+
+TokenScanner.CARRIAGE_RETURN = 0x0D;
+TokenScanner.LINE_FEED = 0x0A;
+TokenScanner.SPACE = 0x20;
+TokenScanner.TAB = 0x09;
+
+TokenScanner.DOLLAR_SIGN = 0x24;
+TokenScanner.DOUBLE_QUOTE = 0x22;
+TokenScanner.SINGLE_QUOTE = 0x27;
+TokenScanner.BACKSLASH = 0x5C;
+TokenScanner.UNDERSCORE = 0x5F;
+TokenScanner.BACKTICK = 0x60;
+
+TokenScanner.UPPER_A = 0x41;
+TokenScanner.UPPER_F = 0x46;
+TokenScanner.UPPER_Z = 0x5A;
+TokenScanner.LOWER_A = 0x61;
+TokenScanner.LOWER_C = 0x63;
+TokenScanner.LOWER_E = 0x65;
+TokenScanner.LOWER_F = 0x66;
+TokenScanner.LOWER_I = 0x69;
+TokenScanner.LOWER_N = 0x6E;
+TokenScanner.LOWER_P = 0x70;
+TokenScanner.LOWER_R = 0x72;
+TokenScanner.LOWER_S = 0x73;
+TokenScanner.LOWER_T = 0x74;
+TokenScanner.LOWER_U = 0x75;
+TokenScanner.LOWER_X = 0x78;
+TokenScanner.LOWER_Z = 0x7A;
+
+TokenScanner.DIGIT_0 = 0x30;
+TokenScanner.DIGIT_9 = 0x39;
+
+TokenScanner.EOF = null;
+
+// XXX Need to separate l10n concerns from mux/demux concerns...
+TokenScanner.ERROR_COMMENT_ABRUPT_END = "Unterminated block comment";
+TokenScanner.ERROR_DECIMAL_DIGIT_EXPECTED = "Decimal digit expected";
+TokenScanner.ERROR_HEXADECIMAL_DIGIT_EXPECTED = "Hexadecimal digit expected";
+TokenScanner.ERROR_INVALID_NUMBER_LITERAL = "Invalid numeric literal";
+TokenScanner.ERROR_INVALID_STRING_ESCAPE = "Invalid string escape sequence";
+TokenScanner.ERROR_INVALID_TRIPLE_SLASH = "Invalid triple slash entity";
+TokenScanner.ERROR_MALFORMED_TEMPLATE_CONTENT = "Malformed template content";
+TokenScanner.ERROR_STRING_ABRUPT_END = "Unterminated string literal";
+TokenScanner.ERROR_TEMPLATE_ABRUPT_END = "Unterminated template";
+TokenScanner.ERROR_UNRECOGNIZED_TOKEN = "Unrecognized token";
+
+// For internal use only
+TokenScanner.UrgentError = class UrgentError extends Error {
+  constructor(ejector, reason, where) {
+    super(reason);
+    this.ejector = ejector;
+    this.which = reason;
+    this.where = where;
+  }
+
+  static handle(ex) {
+    if (ex instanceof TokenScanner.UrgentError) {
+      return ex.ejector.call(null, ex.which, ex.where);
+    }
+    throw ex;
+  }
+}
+/// </script>
+/// <script>
+/// import { InputIR } from "./InputIR.src";
+/// import { PathResolver } from "./PathResolver.src";
+
+/// export
+class CompilerItem {
+  static from(parsed) {
+    if (parsed.form == InputIR.FORM_TRIPLE) {
+      var target = InputIR.FORM_NORMAL;
+    } else {
+      var target = InputIR.FORM_TRIPLE;
+    }
+
+    if (parsed.path) {
+      var path = parsed.path;
+    }
+
+    return new CompilerItem(parsed, target, path);
+  }
+
+  constructor(parsed, target, path = null) {
+    this.parsed = parsed;
+    this.target = target;
+    if (path == null && parsed.entry) {
+      this.path = this.inferFileName(parsed.imports);
+    } else {
+      this.path = path;
+    }
+
+    this._name = null;
+
+    this.module = null;
+    this.program = null;
+  }
+
+  inferFileName(imports = this.parsed.imports) {
+    if (imports.length) {
+      let fore = imports[0].path.value;
+      let index = fore.lastIndexOf(".");
+      if (index >= 0) {
+        let extension = fore.substring(index);
+        if (imports.every((x) => (x.path.value.endsWith(extension)))) {
+          return this.name + extension;
+        }
+      }
+    }
+    return null;
+  }
+
+  get name() {
+    if (this._name == null) {
+      this._name = CompilerItem.resolveName(this.parsed);
+    }
+    return this._name;
+  }
+
+  static resolveName(parsed) {
+    // assert(!(parsed.name && parsed.entry))
+    if (parsed.name) {
+      return parsed.name;
+    } else if (parsed.entry) {
+      return parsed.entry.name;
+    }
+    throw new CompilerItem.NamingError("Anonymous module");
+  }
+
+  get link() {
+    return this.parsed.link;
+  }
+
+  get text() {
+    return this.module.toString(this.target);
+  }
+}
+
+CompilerItem.NamingError = class NamingError extends Error { };
+
+// The build process benefits from an object model with a few extra slots for
+// metadata and synchronization, and we might as well make it a smart data
+// holder while we're here...
+CompilerItem.BuildItem = class BuildItem extends CompilerItem {
+  constructor(id, cache) {
+    super(null, InputIR.FORM_TRIPLE, id);
+    this.cache = cache;
+
+    this.dependIDs = [];
+    this.reachable = false;
+
+    this.priority = null;
+  }
+
+  getRelated(twig) {
+    let id = PathResolver.normalizePath(twig, this.path);
+    return BuildItem.getCachedItem(id, this.cache);
+  }
+
+  static getCachedItem(id, cache) {
+    if (!cache.has(id)) {
+      cache.set(id, new BuildItem(id, cache));
+    }
+    return cache.get(id);
+  }
+
+  get parsed() {
+    return this._parsed;
+  }
+
+  set parsed(value) {
+    this._parsed = value;
+
+    // Accommodating `CompilerItem` constructor...
+    if (value != null) {
+      let stripped = strip(this.path);
+
+      function strip(path) { // "foo/bar/baz.a68" should become "baz"
+        let fileName = path.substring(path.lastIndexOf("/") + 1);
+        return fileName.substring(0, fileName.indexOf("."));
+      }
+
+      if (this.name != stripped) {
+        const $ = JSON.stringify;
+        throw new Error(
+          "Illegal name " + $(this.name) + " for file at path " + $(this.path)
+        );
+      }
+    }
+  }
+}
+/// </script>
+/// <script>
+/// import { SimpleStringParser } from "./SimpleStringParser.src";
+/// import { TextSlice } from "./TextSlice.src";
+
+/// export ...
+class InputIR {
+  // NB: This doesn't particularly belong here; we're just taking advantage of
+  // the fact that it being here means we can avoid mutual (i.e. cyclical)
+  // dependencies, compared to keeping it with either the parser or emitter.
+  static inferMode(trigger) {
+    if (trigger.content.startsWith(InputIR.TRIPLE_MARK)) {
+      return InputIR.FORM_TRIPLE;
+    }
+    return InputIR.FORM_NORMAL;
+  }
+}
+
+InputIR.Module = class Module {
+  // NB: Even in compilation form, the region is expected not to be bracketed
+  // by open and close delimiters--just the actual module text.
+  constructor(form, region = null) {
+    this.form = form;
+    this.region = region;
+    this.attributes = [];
+    this.imports = [];
+    this.exports = [];
+    this.name = null;
+    this.path = null;
+    this.link = null;
+    this.entry = null;
+  }
+
+  addAttribute(...args) {
+    let result = new InputIR.Attribute(...args);
+    switch (result.name) {
+      case "path":
+        this.path = result.value;
+      break;
+      default:
+        return null;
+      break;
+    }
+    this.attributes.push(result);
+    return result;
+  }
+
+  addEntry(...args) {
+    let result = new InputIR.ShuntingIIFE(...args);
+    this.entry = result;
+    return result;
+  }
+
+  addExport(...args) {
+    let result = new InputIR.ExportDeclaration(...args);
+    this.exports.push(result);
+    return result;
+  }
+
+  addImport(...args) {
+    let result = new InputIR.ImportDeclaration(...args);
+    this.imports.push(result);
+    return result;
+  }
+}
+
+InputIR.ShuntingIIFE = class ShuntingIIFE {
+  constructor(trigger, name = null, extent = null) {
+    this.trigger = trigger;
+    this.name = name;
+    this.extent = extent;
+  }
+}
+
+InputIR.ExportDeclaration = class ExportDeclaration {
+  constructor(trigger, post, escape, body) {
+    // assert(trigger.kind == Token.EXPORT)
+    this.trigger = trigger;
+    // assert(post.kind == Token.WHITESPACE)
+    this.post = post;
+    // assert(trigger.position + trigger.length == post.position)
+    // assert(!escape || post.position + post.length == escape.position)
+    this.tokens = [ trigger, post ];
+    this.escape = escape;
+    if (escape) {
+      this.tokens.push(...escape);
+    }
+    this.body = body;
+  }
+
+  extract(text = null) {
+    let start = this.trigger.position;
+    let end = this.body.offset + this.body.length;
+    return TextSlice.between(text, start, end);
+  }
+}
+
+InputIR.ImportDeclaration = class ImportDeclaration {
+  constructor(trigger, tail, name, path) {
+    // assert(trigger.kind == Token.EXPORT)
+    this.trigger = trigger;
+    // assert(tail.indexOf(name) >= 0)
+    // assert(tail.indexOf(spec) >= 0)
+    this.tail = tail;
+
+    this.name = name;
+    this.path = path;
+  }
+
+  extract(text = null) {
+    let start = this.trigger.position;
+    let last = this.tail[this.tail.length - 1];
+    let end = last.position + last.content.length;
+    return TextSlice.between(text, start, end);
+  }
+}
+
+InputIR.Attribute = class Attribute {
+  constructor(lhs, rhs, post, pre = null) {
+    this.lhs = lhs;
+    this.rhs = rhs;
+    // assert(!pre || ProgramText.getLineConvention(pre.content) >= 0)
+    // assert(!pre || pre.position + pre.content.length == lhs.position)
+    // assert(ProgramText.getLineConvention(post.content) >= 0)
+    // assert(rhs.position + rhs.content.length == post.position)
+    this.margin = pre;
+    this.terminator = post;
+
+    this._value = null;
+  }
+
+  get name() {
+    const { FORM_TRIPLE } = InputIR;
+    const { TRIPLE_MARK } = InputIR;
+    if (InputIR.inferMode(this.lhs) == FORM_TRIPLE) {
+      var where = TRIPLE_MARK.length;
+    } else {
+      var where = 0;
+    }
+    // assert(this.lhs.content.charAt(where) == "$")
+    // assert(this.lhs.content.endsWith("$"))
+    return this.lhs.content.substring(where + 1, this.lhs.content.length - 1);
+  }
+
+  get value() {
+    if (this._value == null) {
+      // assert(this.rhs.kind == Token.STRING_LITERAL)
+      this._value = SimpleStringParser.eval(this.rhs.content);
+    }
+    return this._value;
+  }
+
+  extract(text = null) {
+    let start = this.lhs.position;
+    let end = this.terminator.position + this.terminator.content.length;
+    return TextSlice.between(text, start, end);
+  }
+}
+
+InputIR.TRIPLE_MARK = "/// ";
+
+// TODO Make these bitmasks so the parser can have a MIXED_INPUT mode.
+InputIR.FORM_NORMAL = 0;
+InputIR.FORM_TRIPLE = 1;
+
+InputIR.GBlock = class GBlock { };
+
+InputIR.GBlock.START_SEQUENCE = `//? <${"script"}>\n`;
+InputIR.GBlock.STOP_SEQUENCE = `//? <${"/script"}>\n`;
+
+InputIR.TBlock = class TBlock { };
+
+InputIR.TBlock.START_SEQUENCE = `/// <${"script"}>\n`;
+InputIR.TBlock.STOP_SEQUENCE = `/// <${"/script"}>\n`;
+/// </script>
+/// <script>
+/// import { SimpleScanner } from "./SimpleScanner.src";
+
+/// export
+class SimpleStringParser {
+  constructor(input) {
+    this._scanner = new SimpleScanner(input);
+    this.literal = null;
+    this.value = null;
+  }
+
+  static eval(input) {
+    let parser = new SimpleStringParser(input);
+    parser.run();
+    return parser.value;
+  }
+
+  run() {
+    let quote = this._scanner.readCodePoint();
+    let isEscaped = false;
+    let result = quote;
+    let jsonSafe = "";
+    while (!(this._scanner.tip == quote && !isEscaped)) {
+      if (this._scanner.tip == "") throw new Error("Unexpected EOF");
+      if (quote == "'") {
+        if (this._scanner.tip == "\"" && !isEscaped) {
+          jsonSafe += "\\";
+        } else if (this._scanner.tip == "'" && isEscaped) {
+          jsonSafe = jsonSafe.substring(0, jsonSafe.length - 1);
+        }
+      }
+      if (!isEscaped) {
+        if (this._scanner.tip == "\u2028" || this._scanner.tip == "\u2029") {
+          throw new Error("Unterminated string literal");
+        }
+        if (this._scanner.tip == "\\") isEscaped = true;
+      } else {
+        isEscaped = false;
+      }
+      jsonSafe += this._scanner.tip;
+      result += this._scanner.readCodePoint();
+    }
+    result += this._scanner.readCodePoint();
+    this.value = JSON.parse("\"" + jsonSafe + "\"");
+    this.literal = result;
+    if (this._scanner.tip) throw new Error(
+      "Unexpected token " + this._scanner.tip + " after string literal"
+    );
+    return this;
+  }
+}
+/// </script>
+/// <script>
+/// export
+class SimpleScanner {
+  constructor(text) {
+    this.text = text;
+    this.position = 0;
+  }
+
+  get tip() {
+    let unit = this.text.codePointAt(this.position);
+    if (unit == undefined) return "";
+    return String.fromCodePoint(unit);
+  }
+
+  getGenericToken() {
+    if (this.tip == "") return null; // EOF
+    let result = { position: this.position };
+    if (this.isWhitespace(this.tip)) {
+      result.content = "";
+      do {
+        result.content += this.readCodePoint();
+      } while (this.isWhitespace(this.tip));
+      result.type = SimpleScanner.WHITESPACE;
+    } else {
+      result.type = SimpleScanner.UNKNOWN;
+    }
+    return result;
+  }
+
+  readCodePoint() {
+    let result = this.tip;
+    this.position += result.length;
+    return result;
+  }
+
+  isWhitespace(x) {
+    return (x == " " || x == "\t" || x == "\r" || x == "\n");
+  }
+}
+
+SimpleScanner.UNKNOWN = -1;
+SimpleScanner.WHITESPACE = 0;
+/// </script>
+/// <script>
+/// export
+class TextSlice {
+  constructor(source, offset, length = null) {
+    this.source = source;
+    this.offset = offset;
+    this.length = length;
+  }
+
+  static between(text, start, end) {
+    if (start > end) throw new Error("Illegal indexes");
+    return new TextSlice(text, start, end - start);
+  }
+
+  toString() {
+    return this.source.substring(this.offset, this.offset + this.length);
+  }
+}
+/// </script>
+/// <script>
+/// export
+class PathResolver {
+  static normalizePath(path, reference = "") {
+    if (!PathResolver.isRelative(path)) return path;
+    let normalized = [];
+    let parts = reference.split("/");
+    parts.pop();
+    parts = parts.concat(path.split("/"));
+    for (let i = 0; i < parts.length; ++i) {
+      switch (parts[i]) {
+        case ".":
+          // no-op
+        break;
+        case "..":
+          let popped = normalized.pop();
+          if (popped == undefined) throw new Error(
+            "Path forays outside local root: " + JSON.stringify(path) + " " +
+            "(relative to " + JSON.stringify(reference) + ")"
+          );
+        break;
+        default:
+          normalized.push(parts[i]);
+        break;
+      }
+    }
+    return normalized.join("/");
+  }
+
+  static isRelative(path) {
+    return path.startsWith("./") || path.startsWith("../");
+  }
+}
+/// </script>
+/// <script>
+/// import { InputIR } from "./InputIR.src";
+/// import { OutputIR } from "./OutputIR.src";
+
+// TODO need to preserve/respect linebreak conventions...
+
+/// export
+class Emitter {
+  // NB: Neither emitter instances nor any nodes are tailored at the time of
+  // instantiation (or after) toward a particular _kind_ of output (for normal
+  // form vs compiled).  The design is meant to be fully parametric, so you
+  // can ask the same instance for either form.
+  constructor(blockStyle = InputIR.TBlock) {
+    this._blockStyle = blockStyle;
+    this.modules = [];
+  }
+
+  get blockStyle() {
+    return this._blockStyle;
+  }
+
+  set blockStyle(which) {
+    for (let i = 0, n = this.modules.length; i < n; ++i) {
+      for (let j = 0, m = this.modules[i].children.length; j < m; ++j) {
+        if (this.modules[i].children[j] instanceof OutputIR.DelimiterNode) {
+          this.modules[i].children[j].style = which;
+        }
+      }
+    }
+    this._blockStyle = which;
+  }
+
+  static from(modules, blockStyle = undefined) {
+    let emitter = new Emitter(blockStyle);
+    for (let i = 0, n = modules.length; i < n; ++i) {
+      emitter.prepareForOutput(modules[i]);
+    }
+    return emitter;
+  }
+
+  textify(form = InputIR.FORM_NORMAL) {
+    let pieces = [];
+    for (let i = 0, n = this.modules.length; i < n; ++i) {
+      pieces.push(this.modules[i].toString(form));
+    }
+    return pieces.join("");
+  }
+
+  prepareForOutput(module) {
+    const { BEGIN_NODE } = OutputIR.DelimiterNode;
+    const { END_NODE } = OutputIR.DelimiterNode;
+
+    let { imports, exports, attributes, region } = module;
+    let hot = this._getHotNodes(imports, exports, attributes);
+    // assert(hot.length >= 1) XXX what about import-free shunting block?
+
+    let result = new OutputIR.ModuleNode(module);
+    result.addChild(new OutputIR.DelimiterNode(BEGIN_NODE, this.blockStyle));
+
+    const $from = OutputIR.VerbatimNode.from;
+    let mark = region.offset;
+    let end = region.offset + region.length;
+    for (let i = 0, n = hot.length; i < n; ++i) {
+      // NB: The placement refers to the area being replaced.  (Allowed to be
+      // zero-length, in which case, we're just doing a simple insertion.)
+      let { placement } = hot[i];
+      if (mark > placement.offset) {
+        throw new Error("Overlapping slices"); // XXX
+      }
+      result.addChild($from(region.source, mark, placement.offset));
+      result.addChild(hot[i]);
+      mark = placement.offset + placement.length;
+    }
+    result.addChild($from(region.source, mark, end));
+
+    result.addChild(new OutputIR.DelimiterNode(END_NODE, this.blockStyle));
+    this.modules.push(result);
+    return result;
+  }
+
+  _getHotNodes(imports, exports, attributes) {
+    let nodes = [
+      ...imports.map((x) => (new OutputIR.ImportNode(x))),
+      ...exports.map((x) => (new OutputIR.ExportNode(x))),
+      ...attributes.map((x) => (OutputIR.AttributeNode.from(x)))
+    ];
+
+    if (attributes.length) {
+      nodes.push(OutputIR.SeparatorNode.from(attributes[0]));
+    }
+
+    return nodes.sort((a, b) => (a.placement.offset - b.placement.offset));
+  }
+}
+/// </script>
+/// <script>
+/// import { InputIR } from "./InputIR.src";
+/// import { TextSlice } from "./TextSlice.src";
+
+/// export ...
+const OutputIR = { };
+
+OutputIR.ModuleNode = class ModuleNode {
+  constructor(module) {
+    this.children = [];
+  }
+
+  addChild(node) {
+    if (node) this.children.push(node);
+  }
+
+  toString(into = InputIR.FORM_NORMAL) {
+    let pieces = [];
+    for (let i = 0, n = this.children.length; i < n; ++i) {
+      pieces.push(this.children[i].toString(into));
+    }
+    return pieces.join("");
+  }
+
+  addAttribute(name, value) {
+    let index = this.children.length;
+    while (!separator) {
+      if (--index < 0) throw new Error("Weird node structure"); // XXX
+      let node = this.children[index];
+      if (node instanceof OutputIR.AttributeNode) {
+        if (node.name == name) {
+          throw new Error("Duplicate attribute: " + name);
+        }
+      } else if (node instanceof OutputIR.SeparatorNode) {
+        var separator = node;
+        index += 1;
+      } else if (!(node instanceof OutputIR.DelimiterNode)) {
+        // Getting the offset (placement) right doesn't matter, since we're
+        // manipulating the tree directly; there's no validation to fail.
+        var separator = new OutputIR.SeparatorNode("\n");
+        this.children.splice(index + 1, 0, separator);
+        index += 2;
+      }
+    }
+    this.children.splice(index, 0, new OutputIR.AttributeNode(name, value));
+  }
+}
+
+OutputIR.DelimiterNode = class DelimiterNode {
+  constructor(kind, style = InputIR.TBlock) {
+    this.kind = kind;
+    this.style = style;
+  }
+
+  toString(into = InputIR.FORM_NORMAL) {
+    if (into == InputIR.FORM_TRIPLE) {
+      let { START_SEQUENCE } = this.style;
+      let { STOP_SEQUENCE } = this.style;
+      switch (this.kind) {
+        case DelimiterNode.BEGIN_NODE:
+          return START_SEQUENCE;
+        break;
+        case DelimiterNode.END_NODE:
+          return STOP_SEQUENCE;
+        break;
+      }
+      throw new Error("Ineligible node");
+    }
+    return "";
+  }
+}
+
+OutputIR.DelimiterNode.BEGIN_NODE = -1;
+OutputIR.DelimiterNode.END_NODE = 1;
+
+OutputIR.VerbatimNode = class VerbatimNode {
+  constructor(slice) {
+    this.slice = slice;
+  }
+
+  static from(text, start, end) {
+    if (start == end) return null;
+    return new OutputIR.VerbatimNode(TextSlice.between(text, start, end));
+  }
+
+  toString(into = undefined) {
+    return String(this.slice);
+  }
+}
+
+OutputIR.ImportNode = class ImportNode {
+  constructor(declaration) {
+    this.declaration = declaration;
+    this.placement = declaration.extract();
+  }
+
+  toString(into = InputIR.FORM_NORMAL) {
+    if (into == InputIR.FORM_TRIPLE) {
+      var head = "/// import";
+    } else {
+      var head = "import";
+    }
+    return head + this.declaration.tail.map((x) => (x.content)).join("");
+  }
+}
+
+OutputIR.ExportNode = class ExportNode {
+  constructor(declaration) {
+    this.declaration = declaration;
+    this.placement = declaration.extract();
+  }
+
+  toString(into = InputIR.FORM_NORMAL) {
+    let edge = this.declaration.tokens[this.declaration.tokens.length - 1];
+    let body = this.declaration.body;
+    let extra = TextSlice.between( // XXX necessary?
+      body.source, edge.position + edge.content.length, body.offset
+    );
+    return this._getVariant(into) + String(extra) + String(body);
+  }
+
+  _getVariant(form) {
+    if (form == InputIR.inferMode(this.declaration.trigger)) {
+      return this.declaration.tokens.map((x) => (x.content)).join("");
+    } else if (form == InputIR.FORM_TRIPLE) {
+      if (this.declaration.post.content == "\n") {
+        return "/// export\n";
+      } else if (this.declaration.post.content == " ") {
+        return "/// export ...\n";
+      } else {
+        throw new Error; // XXX
+      }
+    } else if (form == InputIR.FORM_NORMAL) {
+      if (this.declaration.escape) {
+        // assert(this.declaration.escape[0].content == " ")
+        // assert(this.declaration.escape[1].kind == Token.DOT_DOT_DOT)
+        return "export ";
+      }
+      // assert(this.declaration.post.content == "\n")
+      return "export\n";
+    }
+  }
+}
+
+OutputIR.AttributeNode = class AttributeNode {
+  // NB: Linebreak should be explicitly specified for synthesized attributes.
+  constructor(name, value, linebreak = "\n", placement = null) {
+    this.name = name;
+    this.value = value;
+    this.linebreak = linebreak;
+    this.placement = placement;
+  }
+
+  static from(attribute) {
+    let { name, value, terminator } = attribute;
+    let placement = attribute.extract();
+    return new AttributeNode(name, value, terminator.content, placement);
+  }
+
+  toString(into = InputIR.FORM_NORMAL) {
+    if (into == InputIR.FORM_TRIPLE) {
+      // XXX This makes assumptions about whitespace around the colon...
+      return (
+        "/// $" + this.name + "$" +
+        ": " +
+        JSON.stringify(this.value) +
+        this.linebreak
+      );
+    }
+    return "";
+  }
+}
+
+OutputIR.SeparatorNode = class SeparatorNode {
+  constructor(content, placement = null) {
+    // assert(content == "\n" || content == "\r\n")
+    this.content = content;
+    this.placement = placement;
+  }
+
+  static from(attribute) {
+    let { position, content } = attribute.margin;
+    let placement = new TextSlice(null, position, content.length);
+    return new SeparatorNode(content, placement);
+  }
+
+  toString(into = InputIR.FORM_NORMAL) {
+    if (into == InputIR.FORM_TRIPLE) {
+      return this.content;
+    }
+    return "";
+  }
+}
+/// </script>
+/// <script>
+/// import { ErrorCommons } from "./ErrorCommons.src";
+/// import { InputIR } from "./InputIR.src";
+/// import { SimpleStringParser } from "./SimpleStringParser.src";
+/// import { SourceProcessor } from "./SourceProcessor.src";
+/// import { SymbolScope } from "./SymbolScope.src";
+/// import { TextSlice } from "./TextSlice.src";
+/// import { Token } from "./Token.src";
+/// import { TokenScanner } from "./TokenScanner.src";
+
+// TODO
+// - Improve error handling
+// - Spec out and implement a full grammar; don't rely on the assumption that
+//   if certain extracts are "balanced" then they're fine.
+
+/// export
+class RealParser {
+  constructor() {
+    this.modules = [];
+
+    this._form = null;
+    this._source = null;
+    this._style = null;
+
+    this._currentScope = null;
+
+    this.$nameModuleFunction = this._onModuleFunctionName.bind(this);
+    this.$nameModuleEntry = this._onModuleEntryName.bind(this);
+  }
+
+  _addToInputStream(text, form) {
+    this._setInputType(form);
+    this._source = new SourceProcessor(text);
+  }
+
+  // TODO Allow mixed mode input?
+  _setInputType(form) {
+    if (form != this._form && this._form != null) {
+      return this._eject("Invalid or incompatible input type"); // XXX
+    }
+    this._form = form;
+  }
+
+  get currentToken() {
+    return this._source.token;
+  }
+
+  ingestCompilationText(text, blockStyle = null) {
+    const { FORM_TRIPLE } = InputIR;
+
+    if (blockStyle != null) {
+      this._style = blockStyle;
+    }
+
+    this._addToInputStream(text, FORM_TRIPLE);
+
+    let parsed = [];
+    do {
+      let before = this._source.position;
+      var module = this._parseModuleText(FORM_TRIPLE);
+      if (!module) {
+        this._eject("Encountered trailing text", this._makeJunkToken(before));
+      }
+      parsed.push(module);
+    } while (this._source.position < text.length);
+
+    this.modules.push(...parsed);
+
+    return parsed;
+  }
+
+  _makeJunkToken(from) {
+    let trailing = this._source.text.substring(from);
+    return new Token(Token.UNEXPECTED_JUNK, from, trailing);
+  }
+
+  _parseModuleText(form) {
+    const { FORM_TRIPLE } = InputIR;
+
+    let textStart = this._source.position;
+    let which = this._next();
+    if (!which) return null;
+
+    let module = new InputIR.Module(form);
+    this._currentScope = SymbolScope.createTop(module);
+
+    if (form == FORM_TRIPLE) {
+      textStart = this._expectOpenDelimiter(this.currentToken);
+      which = this._next();
+    }
+
+    while (which && which != Token.CLOSE_DELIMITER) {
+      switch (which) {
+        case Token.EXPORT:
+          this._parseExportDeclaration(this.currentToken);
+        break;
+        case Token.IDENTIFIER_NAME:
+          this._parseSimpleAssignment(this.currentToken);
+        break;
+        case Token.IMPORT:
+          this._parseImportDeclaration(this.currentToken);
+        break;
+        case Token.VOID:
+          this._parseIIFE(this.currentToken);
+        break;
+        default:
+          if (which != Token.SEMICOLON && which != Token.ATTRIBUTE_NAME) {
+            return this._eject("Unexpected token: " + which); // XXX
+          }
+        break;
+      }
+
+      if (which == Token.ATTRIBUTE_NAME) {
+        if (form == FORM_TRIPLE) {
+          which = this._parseAttributeSection(this.currentToken);
+          break;
+        }
+        return this._eject("Unexpected token: " + which), null; // XXX
+      }
+
+      which = this._next();
+    }
+    let textStop = this._source.position;
+
+    if (form == FORM_TRIPLE) {
+      let token = this.currentToken;
+      this._expect(token.kind, Token.CLOSE_DELIMITER);
+      this._checkBlockStyle(this._getBlockStyle(token), this._style);
+      textStop = token.position;
+      if (this._next(true) && !this._source.isNewLine()) {
+        return this._eject("Invalid delimiter: " + which), null; // XXX
+      }
+    } else if (which == Token.CLOSE_DELIMITER) {
+      return this._eject("Unexpected token: " + which), null; // XXX
+    }
+
+    // NB: Given the way shorthand scopes are handled, this is effectively
+    // dead code, because it shouldn't be possible to satisfy this condition.
+    // We're leaving it here, nevertheless; this is the kind of error we
+    // *should* be giving, instead of the ones that users actually see...
+    if (module.name && module.entry) {
+      let token = module.entry.trigger;
+      this._eject(
+        "Program initialization must be confined to shunting block", token
+      );
+    }
+
+    module.region = TextSlice.between(this._source.text, textStart, textStop);
+
+    return module;
+  }
+
+  _next(allowWhitespace = false) {
+    return this._source.nextToken(allowWhitespace);
+  }
+
+  _expectOpenDelimiter(token) {
+    this._expect(token.kind, Token.OPEN_DELIMITER);
+    this._checkBlockStyle(this._getBlockStyle(token), this._style);
+
+    this._expect(this._next(true));
+    if (!this._source.isNewLine()) {
+      return this._eject("Expected newline");
+    }
+    return this._source.position;
+  }
+
+  _getBlockStyle(token) {
+    if (token.kind == Token.OPEN_DELIMITER ||
+        token.kind == Token.CLOSE_DELIMITER) {
+      switch (String(token.content.split(" ", 1))) {
+        case "//?": return InputIR.GBlock;
+        case "///": return InputIR.TBlock;
+      }
+    }
+    this._eject("Unrecognized block style"); // XXX
+  }
+
+  _checkBlockStyle(have, want) {
+    if (want == null) {
+      this._style = have;
+    } else if (have != want) {
+      return this._eject("Incompatible or mixed block style"); // XXX
+    }
+  }
+
+  _parseAttributeSection(trigger, scope = this._currentScope) {
+    const { module } = scope.top;
+
+    // There can be at most one attribute stanza--at the end--and attributes
+    // may only appear there, if at all.
+    if (!module.attributes.length) {
+      // Last line of stanza separator belongs to attribute section because it
+      // is synthesized by the compiler, just like attributes themselves, so
+      // we need to make sure it can be excised during decompile.
+      var blank = this._source.getMarginTail();
+      if (!blank) {
+        return this._eject("Malformed text"); // XXX
+      }
+    } else if (this._source.isAtNewStanza()) {
+      return this._eject("Malformed text"); // XXX
+    }
+
+    let kindOfCurrentToken = this._parseAttribute(trigger, blank);
+    while (kindOfCurrentToken == Token.ATTRIBUTE_NAME) {
+      kindOfCurrentToken = this._parseAttribute(this.token);
+    }
+
+    return kindOfCurrentToken;
+  }
+
+  _parseAttribute(trigger, blank = undefined, scope = this._currentScope) {
+    if (scope.top != scope) {
+      return this._eject("Malformed text"); // XXX
+    }
+
+    this._expect(this._next(), Token.COLON);
+    this._expect(this._next(), Token.STRING_LITERAL);
+    if (!this.currentToken.content.startsWith("\"")) {
+      return this._eject("Malformed text"); // XXX
+    }
+    let rhs = this.currentToken;
+    if (!this._next(true) || !this._source.isNewLine()) {
+      return this._eject("Malformed text"); // XXX
+    }
+
+    let boundary = this.currentToken;
+    let attribute = scope.module.addAttribute(trigger, rhs, boundary, blank);
+    if (!attribute) {
+      return this._eject("Malformed text"); // XXX
+    }
+
+    return this._next(true);
+  }
+
+  _parseImportDeclaration(trigger, scope = this._currentScope) {
+    const { module } = scope.top;
+
+    this._expect(trigger.kind, Token.IMPORT);
+    if (InputIR.inferMode(trigger) != module.form) {
+      return this._eject("Incompatible input type"); // XXX
+    } else if (!this._source.isLineFlush()) {
+      return this._eject("Import placement error"); // XXX
+    }
+
+    let name, spec, parts = [ ];
+
+    const $consume = ((accumulation, kind, $receiver = null) => {
+      this._expect(this._next(true), kind);
+      if ($receiver) {
+        $receiver(this.currentToken.content);
+      }
+      accumulation.push(this.currentToken);
+    })
+
+    $consume(parts, Token.WHITESPACE);
+    $consume(parts, Token.OPEN_CURLY);
+    $consume(parts, Token.WHITESPACE);
+    $consume(parts, Token.IDENTIFIER_NAME, ((content) => { name = content }));
+    $consume(parts, Token.WHITESPACE);
+    $consume(parts, Token.CLOSE_CURLY);
+    $consume(parts, Token.WHITESPACE);
+    $consume(parts, Token.FROM);
+    $consume(parts, Token.WHITESPACE);
+    $consume(parts, Token.STRING_LITERAL, ((content) => { spec = content }));
+
+    let path = (new SimpleStringParser(spec)).run();
+
+    let which = this._next(true);
+    if (which == Token.SEMICOLON) {
+      parts.push(this.currentToken);
+      which = this._next(true);
+    }
+
+    // NB: Not `else if`
+    if (which) {
+      if (!this._source.isNewLine()) {
+        return this._eject("Expected line break"); // XXX
+      }
+      parts.push(this.currentToken);
+    }
+
+    let ok = this._currentScope.addModuleDependency(name);
+    if (!ok) {
+      return this._eject("Multiple imports of module", trigger);
+    }
+    module.addImport(trigger, parts, name, path);
+  }
+
+  _parseExportDeclaration(trigger, scope = this._currentScope) {
+    const { module } = scope.top;
+
+    // NB: Must be able to detect multiple exports in an ordinary module as
+    // well as an export appearing in the shunting block after void function.
+    if (module.name != null) {
+      return void(this._eject("Too many exports")); // XXX
+    }
+
+    let [ post, escape ] = this._parseExportVariant(trigger, module.form);
+
+    this._expect(this._next());
+    let start = this.currentToken.position;
+    switch (this.currentToken.kind) {
+      case Token.CONST:
+      case Token.VAR:
+      case Token.LET:
+        var stop = this._parseSimpleAssignment(this.currentToken);
+      break;
+      case Token.CLASS:
+        var stop = this._parseClassDefinition(this.currentToken);
+      break;
+      case Token.FUNCTION:
+        var stop = this._parseModuleFunction(this.currentToken);
+      break;
+      default:
+        return this._eject(
+          "Expected 'const', 'var', 'let', 'class', or 'function' for " +
+          "export (got " + JSON.stringify(this.currentToken.content) + ")"
+        );
+      break;
+    }
+    let body = TextSlice.between(this._source.text, start, stop);
+
+    module.addExport(trigger, post, escape, body);
+  }
+
+  _parseExportVariant(trigger, form) {
+    this._expect(trigger.kind, Token.EXPORT);
+    if (InputIR.inferMode(trigger) != form) {
+      throw new Error("Incompatible input type"); // XXX
+    }
+
+    this._next(true);
+    let post = this.currentToken;
+
+    if (form == InputIR.FORM_TRIPLE) {
+      if (this.currentToken.content == " ") {
+        this._expect(this._next(true), Token.DOT_DOT_DOT);
+        let proximate = this.currentToken;
+        this._next(true);
+        var escape = [ proximate, this.currentToken ];
+      }
+      if (!this._source.isNewLine()) {
+        this._eject("Weird spacing");
+      }
+    }
+
+    return [ post, escape || null ];
+  }
+
+  _parseSimpleAssignment(trigger, scope = this._currentScope) {
+    const { module } = scope.top;
+
+    if (scope.isPrime) {
+      // Trigger is const, var, or let (as in the case of an export).
+      this._expect(this._next(), Token.IDENTIFIER_NAME);
+      module.name = this.currentToken.content;
+      this._next();
+    } else {
+      this._expect(trigger.kind, Token.IDENTIFIER_NAME);
+      while (this._expect(this._next()) == Token.PERIOD) {
+        this._expect(this._next(), Token.IDENTIFIER_NAME);
+      }
+    }
+    this._expect(this.currentToken.kind, Token.EQUALS);
+
+    let which = this._expect(this._next());
+    switch (which) {
+      case Token.FALSE:
+      case Token.NULL:
+      case Token.NUMBER_LITERAL:
+      case Token.STRING_LITERAL:
+      case Token.TAGGABLE_TEMPLATE:
+      case Token.TRUE:
+        // Nothing else to do.
+      break;
+      case Token.CLASS:
+        this._parseClassDefinition(this.currentToken);
+      break;
+      case Token.FUNCTION:
+        this._parseFunctionDefinition(this.currentToken);
+      break;
+      default:
+        if (which == Token.MINUS) {
+          this._expect(this._next(), Token.NUMBER_LITERAL);
+          break;
+        } else if (which == Token.IDENTIFIER_NAME) {
+          if (this.currentToken.content == module.name ||
+              this.currentToken.content == module.link) {
+            while (this._expect(this._next()) == Token.PERIOD) {
+              this._expect(this._next(), Token.IDENTIFIER_NAME);
+            }
+            break;
+          }
+        } else if (which == Token.OPEN_CURLY) {
+          // quasi-namespace
+          this._expect(this._next(), Token.CLOSE_CURLY);
+          break;
+        }
+        return this._eject("Expected simple object on right-hand side");
+      break;
+    }
+
+    this._parseTerminator();
+
+    return this._getGreaterBounds(this.currentToken);
+  }
+
+  _parseTerminator() {
+    let which = this._expect(this._next(true));
+    if (which != Token.SEMICOLON && !this._source.isNewLine() &&
+        which != null) {
+      return this._eject("Unexpected token: " + which), null; // XXX
+    }
+  }
+
+  _getGreaterBounds(token) {
+    return token.position + token.content.length;
+  }
+
+  _parseIIFE(trigger, scope = this._currentScope) {
+    const { module } = scope.top;
+
+    // Two valid cases:
+    // - shunting block (common case)
+    // - function-based shorthand scope
+    if (scope.isPrime) {
+      module.addEntry(trigger);
+      this._expect(this._next(), Token.FUNCTION);
+      module.entry.extent = this._parseFunctionDefinition(
+        this.currentToken, this.$nameModuleEntry
+      );
+    } else {
+      this._parseShorthandScope();
+    }
+
+    this._expect(this._next(), Token.OPEN_PAREN);
+    this._expect(this._next(), Token.CLOSE_PAREN);
+
+    let which = this._expect(this._next(true));
+    if (which != Token.SEMICOLON && !this._source.isNewLine() &&
+        which != null) {
+      return this._eject("Unexpected token: " + which); // XXX
+    }
+  }
+
+  // memoized as `$nameModuleEntry
+  _onModuleEntryName(module, name) {
+    module.entry.name = name;
+  }
+
+  _parseShorthandScope(parent = this._currentScope) {
+    this._expect(this._next(), Token.FUNCTION);
+
+    // NB: shorthand scopes' IIFEs are required to be anonymous
+    this._expect(this._next(), Token.OPEN_PAREN);
+    this._expect(this._next(), Token.IDENTIFIER_NAME);
+    let name = this.currentToken.content;
+    this._expect(this._next(), Token.CLOSE_PAREN);
+
+    this._expect(this._next(), Token.OPEN_CURLY);
+    this._currentScope = new SymbolScope(parent);
+    this._currentScope.addSymbol(name, new SymbolScope.ShorthandAlias(name));
+
+    this._parseProtoAlias(name);
+
+    do {
+      var which = this._next();
+      if (which == Token.CLOSE_CURLY) break;
+      this._expect(which, Token.IDENTIFIER_NAME);
+      if (this.currentToken.content == name) {
+        this._parseSimpleAssignment(this.currentToken);
+      } else {
+        let { name } = this._currentScope.top.module;
+        this._eject("Expected prototype member definition for " + name);
+      }
+    } while (which);
+
+    this._currentScope = parent;
+  }
+
+  _parseProtoAlias(name, scope = this._currentScope) {
+    const { module } = scope.top;
+
+    this._expect(this._next(), Token.IDENTIFIER_NAME);
+    if (this.currentToken.content != name) {
+      this._eject("Prototype alias binding mismatch; expected " + name);
+    }
+    this._expect(this._next(), Token.EQUAL);
+    this._expect(this._next(), Token.IDENTIFIER_NAME);
+    if (this.currentToken.content == module.name) {
+      this._expect(this._next(), Token.PERIOD);
+      do {
+        this._expect(this._next(), Token.IDENTIFIER_NAME);
+        if (this.currentToken.content == "prototype") {
+          return void(this._parseTerminator());
+        } // XXX else need to check that aux class actually defined...
+      } while (this._expect(this._next()) == Token.PERIOD);
+    }
+
+    this._eject("Expected prototype alias for " + module.name);
+  }
+
+  _parseClassDefinition(trigger, scope = this._currentScope) {
+    const { module } = scope.top;
+
+    let which = this._expect(this._next());
+    if (scope.isPrime) {
+      this._expect(which, Token.IDENTIFIER_NAME);
+      module.name = this.currentToken.content;
+      which = this._next();
+    } else {
+      if (which == Token.IDENTIFIER_NAME) {
+        which = this._next();
+      }
+    }
+
+    if (which == Token.EXTENDS) {
+      this._expect(this._next(), Token.IDENTIFIER_NAME);
+      let name = this.currentToken.content;
+      which = this._next();
+      if (scope.isPrime) {
+        module.link = name;
+      } else {
+        if ((name == module.name || name == module.link) &&
+            which == Token.PERIOD) {
+          do {
+            this._expect(this._next(), Token.IDENTIFIER_NAME);
+            which = this._next();
+          } while (which == Token.PERIOD);
+        }
+      }
+    }
+    this._expect(which, Token.OPEN_CURLY);
+    this._expectBalance(which);
+
+    return this._getGreaterBounds(this.currentToken);
+  }
+
+  _parseModuleFunction(trigger) {
+    return (
+      this._parseFunctionDefinition(trigger, this.$nameModuleFunction)
+    );
+  }
+
+  // memoized as `$nameModuleFunction`
+  _onModuleFunctionName(module, name) {
+    if (name == null) {
+      return this._eject("Expected identifier name");
+    }
+    module.name = name;
+  }
+
+  _parseFunctionDefinition(trigger, $onname = null, scope = null) {
+    if (!scope) {
+      scope = this._currentScope;
+    }
+
+    const { module } = scope.top;
+
+    let name = null;
+    let which = this._expect(this._next());
+    if (which == Token.IDENTIFIER_NAME) {
+      name = this.currentToken.content;
+      which = this._next();
+    }
+
+    if ($onname) {
+      $onname.call(null, module, name);
+    }
+
+    this._expect(which, Token.OPEN_PAREN);
+    this._expectBalance(which);
+
+    which = this._expect(this._next(), Token.OPEN_CURLY);
+    this._expectBalance(which);
+
+    return this._getGreaterBounds(this.currentToken);
+  }
+
+  // Since the triple script dialect doesn't yet have a formal grammar, the
+  // bulk of modules' source is only partially processed--we ensure that it
+  // decomposes into lexible tokens, but not much else (for now).
+  _expectBalance(kind) {
+    let stack = [ kind ];
+    while (stack.length) {
+      let kind = this._expect(this._next());
+      switch (kind) {
+        case Token.CLOSE_CURLY:
+          this._expect(stack.pop(), Token.OPEN_CURLY);
+        break;
+        case Token.CLOSE_PAREN:
+          this._expect(stack.pop(), Token.OPEN_PAREN);
+        break;
+        case Token.CLOSE_SQUARE:
+          this._expect(stack.pop(), Token.OPEN_SQUARE);
+        break;
+        case Token.OPEN_CURLY:
+        case Token.OPEN_PAREN:
+        case Token.OPEN_SQUARE:
+          stack.push(kind);
+        break;
+        case Token.ATTRIBUTE_NAME:
+        case Token.OPEN_DELIMITER:
+        case Token.CLOSE_DELIMETER:
+          return void(this._eject("Unexpected token: " + kind)); // XXX
+        break;
+      }
+    }
+  }
+
+  ingestNormalText(source) {
+    this._addToInputStream(source, InputIR.FORM_NORMAL);
+    let module = this._parseModuleText(InputIR.FORM_NORMAL);
+    this.modules.push(module);
+    return module;
+  }
+
+  _expect(kind, want = null) {
+    if (kind == TokenScanner.ERROR) {
+      let why = this._source.error;
+      return this._eject(ErrorCommons.createBadTokenMessage(kind, want, why));
+    } else if (want) {
+      if (kind != want) {
+        return this._eject(ErrorCommons.createBadTokenMessage(kind, want));
+      }
+    } else if (kind == null) {
+      return this._eject("Unexpected EOF");
+    }
+    return kind;
+  }
+
+  _eject(message, token = undefined) {
+    throw new RealParser.SourceError(message, this._source, token);
+  }
+}
+
+RealParser.SourceError = class SourceError extends Error {
+  constructor(message, source, token = source.token) {
+    super(message);
+    this.detail = (!!token) ?
+      ErrorCommons.makeSourceContextString(message, source.text, token) :
+      null;
+  }
+};
+/// </script>
+/// <script>
+/// import { ProgramText } from "./ProgramText.src";
+/// import { Token } from "./Token.src";
+/// import { TokenScanner } from "./TokenScanner.src";
+
+/// export
+class SourceProcessor {
+  constructor(text) {
+    // NB: must be intialized before glider or scanner can do any work--and
+    // they start doing a little work before our constructor even finishes,
+    // so it makes the most sense to initialize this now.
+    this._tokenLines = [];
+
+    this._reifiedToken = null;
+    this._tokenErrorReason = null;
+    this._tokenKind = null;
+    this._tokenStart = null;
+    this._tokenStop = null;
+
+    this._glider = new ProgramText(text);
+    this._glider.onlinestart = ((line) => { this._recordLine(line); });
+
+    this._scanner = new TokenScanner(this._glider);
+    this._scanner.ontoken = ((...args) => { this._recordToken(...args) });
+    this._scanner.onerror = ((...args) => { this._recordJunk(...args) });
+    this._scanner.keepWhitespace = true;
+  }
+
+  _recordLine(line) {
+    this._tokenLines.push(line);
+  }
+
+  _recordToken(kind, begin, end) {
+    this._tokenKind = kind;
+    this._tokenStart = begin;
+    this._tokenStop = end;
+    this._reifiedToken = null;
+  }
+
+  _recordJunk(which, where, scanner) {
+    this._recordToken(Token.UNEXPECTED_JUNK, where, this.position);
+    this._tokenErrorReason = which;
+  }
+
+  get error() {
+    return this._tokenErrorReason;
+  }
+
+  get token() {
+    if (!this._reifiedToken && this._tokenKind) {
+      let content = this.text.substring(this._tokenStart, this._tokenStop);
+      let token = new Token(this._tokenKind, this._tokenStart, content);
+      this._reifiedToken = token;
+    }
+    return this._reifiedToken;
+  }
+
+  nextToken(allowWhitespace) {
+    // NB: The scanner is already configured to include whitespace tokens, and
+    // we control whether the caller sees them by filtering them here locally.
+    do {
+      this._tokenLines.length = 0;
+      var kind = this._scanner.readNextToken();
+    } while (kind == Token.WHITESPACE && !allowWhitespace);
+
+    if (kind == null) {
+      // Scanner will not dispatch ontoken for EOF, so we handle it ourselves.
+      this._recordToken(null, this.position, this.position);
+    } else if (kind != Token.WHITESPACE) {
+      this._doMultilineValidation(
+        this._tokenStart, this._tokenStop, this._tokenLines
+      );
+    }
+
+    return kind;
+  }
+
+  _doMultilineValidation(start, stop, lines) {
+    for (let i = 0, n = lines.length; i < n; ++i) {
+      if (lines[i].start > start) {
+        let run = this.position - lines[i].start;
+        check(run, this, lines[i], `/// `)
+        check(run, this, lines[i], `//? `)
+        check(run, this, lines[i], `import`)
+      }
+    }
+
+    function check(run, source, line, what) {
+      if (run >= what.length) {
+        if (source.text.substr(line.start, what.length) == what) {
+          throw new SourceProcessor.LineViolation(source.token);
+        }
+      }
+    }
+  }
+
+  isAtEOF() {
+    return this._tokenKind == null && this.position >= this.text.length;
+  }
+
+  get position() {
+    return this._scanner.position;
+  }
+
+  get text() {
+    // Implements text interface (`charCodeAt`, `length`, `toString`...)
+    return this._glider;
+  }
+
+  isAtNewStanza() {
+    return (this.getMarginTail() != null);
+  }
+
+  getMarginTail() {
+    if (this._tokenKind != Token.WHITESPACE && !this.isAtEOF() &&
+        this._glider.lines.length > 2) {
+      let text = this._glider;
+      let current = this.findLineForTokenPosition(this._tokenStart);
+      let before = this.findLineForTokenPosition(current.start - 1);
+      // assert(before.token != null)
+      if (isLineEmpty(before, current)) {
+        return current.token;
+      }
+
+      function isLineEmpty(first, next) {
+        // assert(SourceProcessor.prototype.isNewLine.call(null, first.token))
+        return (next.start - first.start == first.token.content.length);
+      }
+    }
+    return null;
+  }
+
+  findLineForTokenPosition(where) {
+    let index = ProgramText.getLineNumber(where, this._glider.lines) - 1;
+    if (index >= 0) {
+      return this._glider.lines[index];
+    }
+    return null;
+  }
+
+  isNewLine(token = this.token) {
+    const { UNIX_STYLE } = ProgramText;
+    if (token && token.kind == Token.WHITESPACE) {
+      return ProgramText.getLineConvention(token.content) >= UNIX_STYLE;
+    }
+    return false;
+  }
+
+  isLineFlush(token = this.token) {
+    let line = this.findLineForTokenPosition(token.position);
+    if (!line) throw new Error("Internal error");
+    return (token.position == line.start);
+  }
+}
+
+SourceProcessor.LineViolation = class LineViolation extends Error {
+  constructor(token) {
+    super("Illegal text placement");
+    this.token = token;
+  }
+}
+/// </script>
+/// <script>
+/// export
+class SymbolScope {
+  // NB: only for top-level scopes
+  static createTop(module) {
+    let result = new SymbolScope;
+    result.module = module;
+    return result;
+  }
+
+  constructor(parent = null) {
+    this.parent = parent;
+    this._top = parent && parent.top;
+
+    this._items = new Map();
+
+    this._module = null;
+  }
+
+  get isPrime() {
+    if (this.top == this) {
+      return !this.module.exports.length;
+    }
+    return false;
+  }
+
+  get top() {
+    return this._top;
+  }
+
+  // NB: only for top-level scopes
+  get module() {
+    if (!this.parent) {
+      if (this._module) {
+        return this._module;
+      }
+      throw new Error("Invalid access pattern; not available");
+    }
+    throw new Error("Invalid access pattern; not permitted");
+  }
+
+  // NB: only for top-level scopes
+  set module(value) {
+    if (!this.parent) {
+      if (!this._module) {
+        // assert(this._top == null)
+        this._top = this;
+        this._module = value;
+        return;
+      }
+      throw new Error("Invalid write pattern; overwrite attempt");
+    }
+    throw new Error("Invalid write pattern; not permitted");
+  }
+
+  addModuleDependency(name) {
+    if (this.module != null) {
+      let overwrite = this.addSymbol(name, new SymbolScope.Extern(name));
+      return !overwrite;
+    }
+    throw new Error("Module import not allowed at this level");
+  }
+
+  addSymbol(name, thing) {
+    let result = this._items.has(name);
+    this._items.set(name, thing);
+    return result;
+  }
+}
+
+SymbolScope.Extern = class Extern {
+  constructor(name) {
+    this.name = name;
+  }
+}
+
+SymbolScope.ShorthandAlias = class ShorthandAlias {
+  constructor(name) {
+    this.name = name;
+  }
+}
+/// </script>
+/// <script>
+// Triple scripts are written by creating a well-defined interface that shall
+// provide most of the "system"-level needs of the overall program.  Rather
+// than interleaving details of the the host environment throughout the
+// concerns of our program, these implementation details are confined to one
+// of several system backends.
+//
+// In our case, we prefer the SystemA design pattern, used here.
+//
+// This class `SystemA` serves mostly as documentation to outline these
+// operations that our program will require from us at the system layer; in
+// some sense, nothing is actually happening here.  It's in each of the other
+// system-level backends (`SystemB`, etc.) that we'll override these stubs
+// with real, working code.
+
+/// export
+class SystemA {
+  /**
+   * Entry point of the system layer, where main.src hands over control to the
+   * implementor of the system interface, and where said implementor is
+   * expected to eventually hand over control to the program it's servicing
+   * (which in our case is the trplkt command processor).  Any host-specific
+   * initialization that needs to happen should go here.
+   *
+   * Since this class `SystemA` is just a dummy implementation for documentary
+   * purposes, we throw an error if we're actually called.  We'll do the same
+   * for the rest of the system-level operations, detailed below.
+   */
+  run() {
+    throw new SystemA.UnimplementedError;
+  }
+
+  // Okay, so for the trplkt compiler, there are really only three "system
+  // calls" that a given backend will need to handle:
+  //
+  // - reading a file
+  // - writing a file
+  // - some means of obtaining our own source code (i.e. the source code of
+  //   the running trplkt script file, for the "init" command)
+  //
+  // The crucial thing is that we design the system layer in such a way that
+  // we're able to implement these operations within the browser just as well
+  // as we can for an application that runs in the terminal using a different
+  // environment.
+  //
+  // Everything else is application logic that depends on these primitives for
+  // interacting with the underlying host environment.
+  //
+  // So we'll codify these in the methods below, and the actual backends
+  // should implement them in a conformant way.  But to repeat, *this* class
+  // (`SystemA`) exists mainly to document the methods, and there's no real
+  // substance to the class definition here.
+  //
+  // Refer to TripleKit.src for how these methods are actually put to work in
+  // context to serve the needs of the compiler.
+
+  /**
+   * Obtains the contents of the file at the given path.  (As a string; this
+   * interface supports only plain text files--this is a compiler!)
+   *
+   * @param path: string
+   *        The path where the file lives.
+   * @return
+   *        Promise<string>
+   */
+  read(path) {
+    throw new SystemA.UnimplementedError;
+  }
+
+  /**
+   * Write to a file at the given path with the given contents.  (Also text
+   * only, like `read` abov.)
+   *
+   * @param path: string
+   *        The path of the file to be written.
+   * @param contents: string
+   *        The text that should be written to the file.
+   * @return
+   *        Promise<void> resolves when the file has been written
+   */
+  write(path, contents) {
+    throw new SystemA.UnimplementedError;
+  }
+
+  /**
+   * Get trplkt's own source code.
+   *
+   * @return
+   *        string
+   */
+  get identity() {
+    // NB: The way we define this as a getter is slightly annoying, because
+    // now it takes a little extra work for `SystemB` and `SystemC` to
+    // actually override it to do the right thing.  Big deal.
+    throw new SystemA.UnimplementedError;
+  }
+
+  /**
+   * A helper to get an instance that actually implements the system
+   * interface.
+   *
+   * @param $SystemKind: constructor<{ interface System }>
+   *        The constructor (`SystemB`, `SystemC`...) for a given backend.
+   * @return
+   *        { interface System } if the given class supports the current host
+   *        environment (and where such return value is an instance of the
+   *        given class), or null otherwise.
+   */
+  static create($SystemKind) {
+    try {
+      return new $SystemKind;
+    } catch (ex) {
+      if (ex instanceof SystemA.ShuntingError) {
+        return null;
+      }
+      throw ex;
+    }
+  }
+}
+
+SystemA.ShuntingError = class ShuntingError extends Error { };
+SystemA.UnimplementedError = class UnimplementedError extends Error { };
+/// </script>
+/// <script>
+/// import { BrowserUI } from "./BrowserUI.src";
+/// import { ConsoleOutput } from "./ConsoleOutput.src";
+/// import { FeedbackLevels } from "./FeedbackLevels.src";
+/// import { FileCache } from "./FileCache.src";
+/// import { SystemA } from "./SystemA.src";
+/// import { TripleKit } from "./TripleKit.src";
+/// import { TrplktCommands } from "./TrplktCommands.src";
+/// import { WebkitFileIngester } from "./WebkitFileIngester.src";
+/// import { ZodLib } from "./ZodLib.src";
+/// import { credits } from "./credits.src";
+
+/// export
+class SystemB extends SystemA {
+  constructor() {
+    super();
+
+    if (typeof(window) == "undefined") {
+      throw new SystemA.ShuntingError("Not a browser environment");
+    }
+
+    this.identity = window.document.body.innerHTML;
+
+    this._document = window.document;
+
+    this._directoryInput = null;
+    this._fileSource = null;
+
+    this._artifacts = new FileCache();
+
+    this.output = new FeedbackLevels(
+      new ConsoleOutput({
+        printLine: (text) => void(this._ui.printFeedback(text))
+      })
+    );
+  }
+
+  set identity(source) {
+    Object.defineProperty(this, `identity`, { value: source });
+  }
+
+  run() {
+    this._document.defaultView.onload = () => {
+      this._ui = new BrowserUI(this, this._document);
+
+      let $$ = this._document.createElement.bind(this._document);
+
+      let fileInput = $$("input");
+      fileInput.setAttribute("type", "file");
+      fileInput.setAttribute("webkitdirectory", "true");
+      fileInput.style.display = "none";
+      this._directoryInput = this._document.head.appendChild(fileInput);
+
+      this._directoryInput.onchange = this._onDirectoryChange.bind(this);
+
+      let $exportFile = this._export.bind(this);
+      this._commands = new TrplktCommands(this);
+      this._commands.onbuild = $exportFile;
+      this._commands.oncreatecredits = $exportFile;
+      this._commands.oninit = $exportFile;
+      this._commands.onpublish = $exportFile;
+      this._commands.ondecompile = this._onScriptDecompiled.bind(this);
+    }
+  }
+
+  read(path) {
+    if (this._fileSource) {
+      let file = this._fileSource.recall(path);
+      return WebkitFileIngester.readBlob(file).then((contents) => {
+        if (contents === null) {
+          return Promise.reject(new TripleKit.NoSuchFileError(path));
+        }
+        return Promise.resolve(contents);
+      });
+    }
+    return Promise.reject(new TripleKit.NoFileSourceError);
+  }
+
+  write(path, contents) {
+    this._artifacts.store(new Blob([ contents ]), path);
+    return Promise.resolve();
+  }
+
+  _export(fileName) {
+    this._saveFile(fileName, this._artifacts.recall(fileName));
+  }
+
+  _saveFile(name, blob) {
+    let anchor = this._document.createElement("a");
+    anchor.href = URL.createObjectURL(blob);
+    anchor.download = name;
+    this._document.head.appendChild(anchor).click();
+    anchor.parentNode.removeChild(anchor);
+  }
+
+  _onScriptDecompiled(names) {
+    this._createZIP(this._artifacts, names).then((data) => {
+      this._saveFile("src.zip", new Blob([ data ]));
+    });
+  }
+
+  _createZIP(cache, names = cache.list()) {
+    let archive = ZodLib.createArchive();
+
+    let pending = names.map((path) =>
+      WebkitFileIngester.readBlob(cache.recall(path), true).then((buffer) => {
+        archive.addFile(path, buffer);
+      })
+    );
+
+    return Promise.all(pending).then(() =>
+      Promise.resolve(archive.zip())
+    );
+  }
+
+  // NB: internal use only (for UI; not part of the abstract system interface)
+  requestFileSource() {
+    this._directoryInput.click();
+  }
+
+  _onDirectoryChange(event) {
+    this._fileSource = WebkitFileIngester.cache(event.target.files);
+    this._ui.acknowledgeFileSource();
+  }
+
+  // NB: internal use only (for UI; not part of the abstract system interface)
+  executeCommand(escapedText) {
+    let commandText = this._unescape(escapedText);
+    let checkSyncAndAsyncErrors = (() => {
+      try {
+        return this._commands.execute(commandText).catch((err) => {
+          // Errors wrapped like this are already dealt with.
+          if (err instanceof TrplktCommands.KnownFatalError) return;
+          // Anything else is unexpected/uncaught.
+          return Promise.reject(err);
+        });
+      } catch (ex) {
+        // ... and we want to handle non-async errors, too; they get converted
+        // to async ones so they can be handled just the same as those above.
+        return Promise.reject(ex);
+      }
+    });
+
+    checkSyncAndAsyncErrors().catch((err) => {
+      this._ui.printFeedback("Encountered internal error.");
+      console.error(err);
+    });
+  }
+
+  _unescape(commandLine) {
+    let $ = (x, offset) => String.fromCodePoint(x.codePointAt(offset));
+    let result = "";
+    for (let i = 0, n = commandLine.length; i < n;) {
+      let codePoint = $(commandLine, i);
+      if (codePoint == "\\") {
+        switch ($(commandLine, ++i)) {
+          case "\\":
+            result += "\\";
+          break;
+          case " ":
+          case "\n":
+            result += " ";
+          break;
+          default: throw new Error("Malformed escape sequence");
+        }
+      } else {
+        result += codePoint;
+        i += codePoint.length;
+      }
+    }
+    return result;
+  }
+}
+/// </script>
+/// <script>
+/// import { ConsoleBuffer } from "./ConsoleBuffer.src";
+/// import { ConsoleOutput } from "./ConsoleOutput.src";
+/// import { ConsoleWidget } from "./ConsoleWidget.src";
+/// import { LineReader } from "./LineReader.src";
+/// import { LineWriter } from "./LineWriter.src";
+/// import { TabBox } from "./TabBox.src";
+/// import { TrplktAppStyle } from "./TrplktAppStyle.src";
+
+/// export
+class BrowserUI {
+  constructor(capos, document) {
+    this._capos = capos;
+    this._document = document;
+
+    this._vtty = new ConsoleBuffer();
+    let writer = new LineWriter(this._vtty);
+    this.input = new LineReader(this._vtty, writer);
+    this.output = new ConsoleOutput(writer);
+
+    this._injectUI();
+
+    this.input.oncommand = this._onConsoleCommand.bind(this);
+  }
+
+  _injectUI() {
+    let container = this._fixQuirks();
+    TrplktAppStyle.applySkin(this._document.body.parentNode);
+
+    let $$ = this._document.createElement.bind(this._document);
+
+    let loadArea = container.appendChild($$("div"));
+    loadArea.className = "load-area";
+
+    let loadButton = $$("label");
+    loadButton.className = "empty file-source-chooser";
+    loadButton.textContent = "Open\u2026";
+    loadButton.style.fontFamily = "sans";
+    this._loadButton = loadArea.appendChild(loadButton);
+
+    this._loadButton.onclick = () => void(this._capos.requestFileSource());
+
+    this._tabBox = new TabBox(container);
+    // let mainPanel = this._tabBox.addTab("Main");
+    // let buildsPanel = this._tabBox.addTab("Artifacts");
+    let consolePanel = this._tabBox.addTab("Console");
+
+    consolePanel.classList.add("console-panel");
+    this.console = new ConsoleWidget(consolePanel, this._vtty, this.input);
+    this.console.focus();
+
+    this._tabBox.ontabswitch = (panel) => {
+      if (panel == consolePanel) this.console.focus();
+    }
+  }
+
+  _fixQuirks(title = "") {
+    this._document.open();
+    this._document.write(
+      "<!DOCTYPE html><html><head><meta charset='utf-8'><title>" + title
+    );
+    this._document.close();
+    return this._document.body;
+  }
+
+  _onConsoleCommand(text) {
+    this._capos.executeCommand(text);
+  }
+
+  acknowledgeFileSource() {
+    this._loadButton.classList.remove("empty");
+  }
+
+  printFeedback(text) {
+    this.output.push(text);
+    this.output.flush("\n");
+  }
+}
+/// </script>
+/// <script>
+/// export
+class ConsoleBuffer {
+  constructor(scrollback = []) {
+    this.lines = [ "" ];
+    this.demarcation = 0;
+    this.cursorX = 0;
+    this.cursorY = 0;
+
+    this.onupdate = null;
+  }
+
+  static isPrintable(character) {
+    return " " <= character && character < "\x7F";
+  }
+}
+/// </script>
+/// <script>
+/// export
+class ConsoleOutput {
+  constructor(printer) {
+    this._printer = printer;
+    this._contents = [];
+  }
+
+  push(text) {
+    this._contents.push(text);
+  }
+
+  flush(sequence) {
+    if (sequence != "\n") throw new Error("newline expected");
+    let line = this._contents.splice(0, Infinity).join("");
+    this._printer.printLine(line);
+  }
+}
+/// </script>
+/// <script>
+/// import { ConsoleBuffer } from "./ConsoleBuffer.src";
+/// import { DoubleTapClipboard } from "./DoubleTapClipboard.src";
+/// import { LineReader } from "./LineReader.src";
+
+/// export
+class ConsoleWidget {
+  constructor(container, buffer, input = null, width, height) {
+    this._cursorState = true;
+    this._rowBoxes = [];
+
+    this.input = input || new LineReader(buffer);
+
+    this._buffer = buffer;
+    this._buffer.onupdate = this._onUpdate.bind(this);
+
+    this._injectNodes(container);
+    this._setDimensions(width, height);
+
+    this._contentBox.addEventListener("keypress", this, false);
+    this._contentBox.addEventListener("keydown", this, false);
+    this._contentBox.addEventListener("keyup", this, false);
+
+    this.clipboard = new DoubleTapClipboard(
+      this._contentBox, this._clipboardBox
+    );
+    this.clipboard.onpaste = this._onPaste.bind(this);
+
+    this.$intercept = this._specialInterceptHandler.bind(this);
+
+    this._doc = container.ownerDocument;
+    this._doc.defaultView.setInterval(this._nextCursorPhase.bind(this), 500);
+  }
+
+  _nextCursorPhase() {
+    this._cursorState = !this._cursorState;
+    this._render(this._buffer, [ this._buffer.cursorY ]);
+  }
+
+  _injectNodes(container) {
+    let $$ = container.ownerDocument.createElement.bind(
+      container.ownerDocument
+    );
+
+    let styleElement = container.appendChild($$("style"));
+    ConsoleWidget.applySkinDefaults(styleElement.sheet);
+
+    this._contentBox = $$("div");
+    this._contentBox.tabIndex = "1";
+    this._contentBox.className = "term-content";
+    container.appendChild(this._contentBox);
+
+    this._clipboardBox = container.appendChild($$("div"));
+  }
+
+  _setDimensions(width = Infinity, height = Infinity) {
+    if (width < Infinity) {
+      this._contentBox.style.width = width + "ch";
+    } else {
+      this._contentBox.style.width = "100%";
+    }
+
+    if (height < Infinity) {
+      this._contentBox.style.height = (height * 1.2) + "em";
+    } else {
+      this._contentBox.style.height = "100%";
+    }
+  }
+
+  static applySkinDefaults(styleSheet) {
+    let $ = styleSheet.insertRule.bind(styleSheet);
+    $(".term-content {" +
+        "outline: 0;" +
+        "display: block;" +
+        "overflow-x: hidden;" +
+        "white-space: nowrap;" +
+        "font-family: fixed, monospace;" +
+        "font-size: 15px;" +
+        "font-variant-ligatures: none;" +
+        "color: #f0f0f0;" +
+        "background: #000000;" +
+    "}");
+
+    $(".term-content:focus .term-cursor {" +
+        "color: #000000;" +
+        "background: #ffffff;" +
+    "}");
+  }
+
+  _onUpdate(buffer, dirtyCoords) {
+    this._render(buffer, dirtyCoords);
+    this._contentBox.scrollTop = this._contentBox.scrollHeight;
+  }
+
+  _render(vtty, dirtyCoords) {
+    if (!dirtyCoords.length) return;
+
+    // In case the active region has been transferred into the scrollback
+    // region since we last rendered, we need to erase any cursor artifact.
+    let cursorCell = this._contentBox.querySelector(".term-cursor");
+    if (cursorCell) {
+      cursorCell.classList.remove("term-cursor");
+    }
+
+    dirtyCoords = dirtyCoords.sort((a, b) => (a - b));
+    let farthest = dirtyCoords[dirtyCoords.length - 1];
+    while (this._rowBoxes.length <= farthest) {
+      this._rowBoxes.push(this._createRowBox());
+    }
+
+    for (let i = 0, n = dirtyCoords.length; i < n; ++i) {
+      this._renderLine(vtty, dirtyCoords[i]);
+    }
+  }
+
+  _renderLine(vtty, y) {
+    let line = vtty.lines[y];
+    let lineCap = line.length - 1;
+    let lineHasCursor = y == vtty.cursorY;
+    if (lineHasCursor) {
+      lineCap = Math.max(lineCap, vtty.cursorX);
+    }
+
+    let lineMarkup = "";
+    for (let x = 0; x <= lineCap; ++x) {
+      let cellMarkup = null;
+      if (x < line.length) {
+        cellMarkup = line[x];
+      }
+      switch (cellMarkup) {
+        case " ":
+          cellMarkup = "&nbsp;";
+        break;
+        case "&":
+          cellMarkup = "&amp;";
+        break;
+        case "\x3E":
+          cellMarkup = "&gt;";
+        break;
+        case "\x3C":
+          cellMarkup = "&lt;";
+        break;
+        case "\"":
+          cellMarkup = "&quot;";
+        break;
+        case "'":
+          cellMarkup = "&#x27;";
+        break;
+        default:
+          if (!ConsoleBuffer.isPrintable(cellMarkup)) {
+            cellMarkup = "&nbsp;";
+          }
+        break;
+      }
+
+      if (lineHasCursor && x == vtty.cursorX && this._cursorState) {
+        cellMarkup = this._buildMarkup(
+          "span", "class=\"term-cursor\"", [ cellMarkup ]
+        );
+      }
+
+      lineMarkup += cellMarkup;
+    }
+
+    this._rowBoxes[y].innerHTML = lineMarkup || "&zwnj;";
+  }
+
+  _buildMarkup(name, attributesText, content = []) {
+    if (attributesText == null) attributesText = "";
+    let result = "<" + name + " " + attributesText + ">";
+    if (content != null) {
+      result += content.join("");
+      result += "<" + "/" + name + ">";
+    }
+    return result;
+  }
+
+  _onPaste(value) {
+    value = value.replace(/\n|\r/g, " "); // XXX
+    for (let i = 0, n = value.length; i < n; ++i) {
+      this.input.process(value[i]);
+    }
+  }
+
+  handleEvent(event) {
+    switch (event.type) {
+      case "keydown":
+        return void(this._onKeyDown(event));
+      case "keypress":
+        return void(this._onKeyPress(event));
+      case "keyup":
+        return void(this._onKeyUp(event));
+      default:
+        return void(console.error("Unexpected event:", event.type));
+    }
+  }
+
+  _onKeyPress(event) {
+    if (event.key.length == 1 && !this._hasModifier(event)) {
+      this._cancelEvent(event);
+      this.input.process(event.key);
+    }
+  }
+
+  _hasModifier(event) {
+    return event.altKey || event.ctrlKey || event.metaKey;
+  }
+
+  _cancelEvent(event) {
+    event.stopPropagation();
+    event.preventDefault();
+  }
+
+  _onKeyDown(event) {
+    if (this._hasModifier(event)) {
+      return void(this._setUpIntercept(this._doc.defaultView));
+    }
+    let input, $ = String.fromCharCode;
+    switch (event.keyCode) {
+      case LineReader.Backspace:
+        input = $(LineReader.Backspace);
+      break;
+      case LineReader.Enter:
+        input = $(LineReader.Enter);
+      break;
+      case ConsoleWidget.LeftKey:
+        input = LineReader.LeftSequence;
+      break;
+      case ConsoleWidget.RightKey:
+        input = LineReader.RightSequence;
+      break;
+    }
+    if (input) {
+      this._cancelEvent(event);
+      this.input.process(input);
+    }
+  }
+
+  _setUpIntercept(view) {
+    view.addEventListener("beforeunload", this.$intercept, false);
+  }
+
+  _specialInterceptHandler(event) {
+    this._cancelEvent(event);
+    this._clearIntercept(this._doc.defaultView);
+  }
+
+  _clearIntercept(view) {
+    view.removeEventListener("beforeunload", this.$intercept, false);
+  }
+
+  _onKeyUp(event) {
+    this._clearIntercept(this._doc.defaultView);
+  }
+
+  focus() {
+    this._contentBox.focus();
+  }
+
+  _createRowBox() {
+    return this._contentBox.appendChild(this._doc.createElement("div"));
+  }
+}
+
+ConsoleWidget.LeftKey = 0x25;
+ConsoleWidget.RightKey = 0x27;
+/// </script>
+/// <script>
+/// export
+class DoubleTapClipboard {
+  constructor(target, container) {
+    this._injectNodes(container);
+
+    this._target = target;
+
+    this.onpaste = null;
+
+    this._target.addEventListener("keydown", this);
+    this._input.addEventListener("keydown", this);
+    this._input.addEventListener("paste", this);
+  }
+
+  _injectNodes(container) {
+    let $$ = container.ownerDocument.createElement.bind(
+      container.ownerDocument
+    );
+
+    container.style.position = "relative";
+
+    this._input = container.appendChild($$("textarea"));
+    this._input.placeholder = "Double-Tap Clipboard (Paste again\u2026)";
+    this._input.style.display = "none";
+    this._input.style.position = "absolute";
+    this._input.style.bottom = "0";
+    this._input.style.right = "0";
+    this._input.style.fontSize = "15px";
+    this._input.style.height = "12em";
+    this._input.style.width = "40ch";
+    this._input.className = "term-clipboard";
+  }
+
+  handleEvent(event) {
+    if (event.target == this._input) {
+      if (event.type == "paste") {
+        this._input.value = event.clipboardData.getData("text");
+        this._onAcceptPaste();
+      } else if (event.keyCode == DoubleTapClipboard.Enter && !event.shiftKey) {
+        this._cancelEvent(event);
+        this._onAcceptPaste();
+      } else if (event.keyCode == DoubleTapClipboard.Escape) {
+        this._input.value = "";
+        this.dismiss();
+      }
+    }
+    if (event.target == this._target) {
+      if (event.ctrlKey && event.key == "v") {
+        this._cancelEvent(event);
+        this._onKeyCombo();
+      }
+    }
+  }
+
+  _cancelEvent(event) {
+    event.stopPropagation();
+    event.preventDefault();
+  }
+
+  _onKeyCombo(event) {
+    this._input.style.display = "block";
+    this._input.focus();
+    this._input.select();
+  }
+
+  _onAcceptPaste(event) {
+    this._dispatch(this.onpaste, this._input.value);
+    this.dismiss();
+  }
+
+  dismiss() {
+    this._input.style.display = "none";
+    this._target.focus();
+  }
+
+  _dispatch(handler, ...args) {
+    if (handler) {
+      handler.apply(null, args);
+    }
+  }
+}
+
+DoubleTapClipboard.Enter = 0x0D;
+DoubleTapClipboard.Escape = 0x1B;
+/// </script>
+/// <script>
+/// import { ConsoleBuffer } from "./ConsoleBuffer.src";
+
+/// export
+class LineReader {
+  constructor(vtty, writer) {
+    this._writer = writer;
+
+    this._prompt = "";
+    this._text = "";
+    this._cursor = 0;
+
+    this.oncommand = null;
+
+    this._update();
+  }
+
+  static formatPrompt(text) {
+    if (text) {
+      return text.trim() + " ";
+    }
+    return "";
+  }
+
+  setPrompt(text) {
+    this._prompt = LineReader.formatPrompt(text);
+    this._update();
+  }
+
+  _reset() {
+    try {
+      return this._text;
+    } finally {
+      this._text = "";
+      this._cursor = 0;
+      this._writer.commit();
+      this._update();
+    }
+  }
+
+  _update() {
+    this._writer.render(this._text, this._cursor, this._prompt);
+  }
+
+  process(input) {
+    let $ = String.fromCharCode;
+    switch (input) {
+      case $(LineReader.Backspace):
+        this._doBackspace();
+      break;
+      case $(LineReader.Enter):
+        this._doEnter();
+      break;
+      case LineReader.LeftSequence:
+        this._doLeft();
+      break;
+      case LineReader.RightSequence:
+        this._doRight();
+      break;
+      default:
+        if (ConsoleBuffer.isPrintable(input)) {
+          this._doInsertCharacter(input);
+        } else {
+          console.warn("dropping unrecognized input", input);
+        }
+      break;
+    }
+  }
+
+  _doBackspace() {
+    if (this._cursor > 0) {
+      this._text = this._removeText(this._cursor);
+      --this._cursor;
+      this._update();
+    }
+  }
+
+  _doEnter() {
+    let command = this._reset();
+    this._dispatch(this.oncommand, command);
+  }
+
+  _dispatch(handler, ...args) {
+    if (handler) {
+      handler.apply(null, args);
+    }
+  }
+
+  _removeText(position, span = -1, original = this._text) {
+    if (span < 0) {
+      return original.substr(0, position + span) + original.substr(position);
+    }
+    return original.substr(0, position) + original.substr(position + span);
+  }
+
+  _doInsertCharacter(input) {
+    this._text = this._insertText(input);
+    ++this._cursor;
+    this._update();
+  }
+
+  _insertText(payload, position = this._cursor, original = this._text) {
+    return original.substr(0, position) + payload + original.substr(position);
+  }
+
+  _doLeft() {
+    if (this._cursor > 0) {
+      --this._cursor;
+      this._update();
+    }
+  }
+
+  _doRight() {
+    if (this._cursor < this._text.length) {
+      ++this._cursor;
+      this._update();
+    }
+  }
+}
+
+LineReader.Backspace = 0x08;
+LineReader.Enter = 0x0D;
+
+LineReader.LeftSequence = "\x1B[D";
+LineReader.RightSequence = "\x1B[C";
+/// </script>
+/// <script>
+/// export
+class LineWriter {
+  constructor(buffer) {
+    this._buffer = buffer;
+  }
+
+  render(text, cursor, prompt = "") {
+    let buffer = this._buffer;
+    if (buffer.lines.length == buffer.demarcation) {
+      buffer.lines.push("");
+    }
+    buffer.lines.splice(buffer.demarcation, 1, prompt + text);
+    buffer.cursorX = prompt.length + cursor;
+    this._dispatch(buffer.onupdate, buffer, [ buffer.demarcation ]);
+
+    this._cachedText = text;
+    this._cachedCursor = cursor;
+    this._cachedPrompt = prompt;
+  }
+
+  _dispatch(handler, ...args) {
+    if (handler) {
+      handler.apply(null, args);
+    }
+  }
+
+  commit(cursorAdjustment = 0) {
+    this._buffer.demarcation = this._buffer.lines.length;
+    this._buffer.cursorY = this._buffer.demarcation + cursorAdjustment;
+    return this._buffer.demarcation;
+  }
+
+  printLine(text) {
+    // add new text to non-active region
+    let { lines, demarcation, cursorY } = this._buffer;
+    lines.splice(demarcation, Infinity, ...text.split("\n"));
+    let newDemarcation = this.commit(cursorY - demarcation);
+
+    // refresh scrollback's new text lines
+    let dirty = [];
+    for (let i = 0, n = newDemarcation - demarcation; i < n; ++i) {
+      dirty.push(demarcation + i);
+    }
+    this._dispatch(this._buffer.onupdate, this._buffer, dirty);
+
+    // refresh active region
+    this.render(this._cachedText, this._cachedCursor, this._cachedPrompt);
+  }
+}
+/// </script>
+/// <script>
+/// export
+class TabBox {
+  constructor(container) {
+    this._tabToPanelMap = new Map();
+
+    let doc = container.ownerDocument;
+    let $$ = doc.createElement.bind(doc);
+
+    let styleElement = container.appendChild($$("style"));
+    TabBox.applySkinDefaults(styleElement.sheet);
+
+    this._nav = container.appendChild($$("nav"));
+    this._nav.className = "tab-strip";
+
+    this.ontabswitch = null;
+    this._nav.onchange = (event) => {
+      this.selectTab(event.target.labels[0]);
+    }
+
+    this._main = container.appendChild($$("section"));
+  }
+
+  static applySkinDefaults(styleSheet) {
+    let $ = styleSheet.insertRule.bind(styleSheet);
+    $("input[name=tabs] {" +
+        "display: none;" +
+    "}");
+
+    $(".tab-strip {" +
+        "padding: .75em;" +
+    "}");
+
+    $(".tab-strip label {" +
+        "box-sizing: border-box;" +
+        "padding: inherit;" +
+        "font-family: sans;" +
+    "}");
+
+    $(".tab-panel {" +
+        "display: none;" +
+    "}");
+
+    $(".tab-panel.foreground {" +
+        "display: block;" +
+    "}");
+  }
+
+  addTab(name) {
+    let doc = this._nav.ownerDocument;
+    let $$ = doc.createElement.bind(doc);
+
+    let tab = this._nav.appendChild($$("label"));
+    tab.innerHTML = name + this._buildMarkup(
+      "input", "type='radio' name='tabs'"
+    );
+
+    let panel = this._main.appendChild($$("div"));
+    panel.className = "tab-panel";
+    this._tabToPanelMap.set(tab, panel);
+
+    if (this._nav.childNodes.length == 1) {
+      this.selectTab(tab);
+    }
+
+    return panel;
+  }
+
+  selectTab(tab) {
+    let foreground = this._nav.querySelector(".selected");
+    if (foreground) foreground.classList.toggle("selected", false);
+    tab.classList.toggle("selected", true);
+
+    foreground = this._main.querySelector(".foreground");
+    if (foreground) foreground.classList.toggle("foreground", false);
+    let panel = this._tabToPanelMap.get(tab);
+    panel.classList.toggle("foreground", true);
+
+    if (this.ontabswitch) {
+      this.ontabswitch.call(null, panel);
+    }
+  }
+
+  _buildMarkup(name, attributesText = "") {
+    return "<" + name + " " + attributesText + ">" + "<" + "/" + name + ">";
+  }
+}
+/// </script>
+/// <script>
+/// export
+class TrplktAppStyle {
+  static applySkin(parent) {
+    let styleElement = parent.ownerDocument.createElement("style");
+    parent.appendChild(styleElement);
+
+    let $ = styleElement.sheet.insertRule.bind(styleElement.sheet);
+    $("body {" +
+        "margin: 0.5em;" +
+        "background-color: #f0f5f8;" +
+    "}");
+
+    $(".tab-strip label.selected {" +
+        "border-top: 4px solid #58b;" +
+        "background-color: #FFF;" +
+    "}");
+
+    $(".load-area {" +
+        "float: right;" +
+        "margin: 0.5em 0;" +
+    "}");
+
+    $(".file-source-chooser {" +
+        "padding: 0.5em 1em 0.5em 1em;" +
+        "border: 1px solid #c5c8cb;" +
+        "border-radius: 4px;" +
+    "}");
+
+    $(".file-source-chooser.empty, .file-source-chooser:hover {" +
+        "background-color: #fff;" +
+    "}");
+
+    $(".term-content {" +
+        "color: #f5f8fb;" +
+        "background-color: #15181b;" +
+    "}");
+
+    $(".term-clipboard {" +
+        "color: #f5f8fb;" +
+        "background-color: #15181b;" +
+        "border: 4px solid #58b;" +
+        "border-radius: 2px;" +
+        "padding: 0.5em;" +
+    "}");
+
+    $(".term-clipboard::selection {" +
+        "background-color: #58b;" +
+    "}");
+
+    $(".console-panel {" +
+        "background-color: #15181b;" +
+        "height: calc(100vh - 4.25em);" +
+        "padding: 0.25em" +
+    "}");
+  }
+}
+/// </script>
+/// <script>
+/// export
+class FeedbackLevels {
+  constructor(target) {
+    this._target = target;
+    this.threshold = FeedbackLevels.THRESHOLD_WARN;
+  }
+
+  error(...messages) {
+    this._log(messages);
+  }
+
+  warn(...messages) {
+    const { THRESHOLD_WARN } = FeedbackLevels;
+    if (this.threshold >= THRESHOLD_WARN) {
+      for (let i = 0, n = messages.length; i < n; ++i) {
+        if (i == 0) {
+          this._target.push("WARNING: " + messages[i]);
+        } else {
+          this._target.push("         " + messages[i]);
+        }
+        this._target.flush("\n");
+      }
+    }
+  }
+
+  report(...messages) {
+    const { THRESHOLD_ALL } = FeedbackLevels;
+    if (this.threshold >= THRESHOLD_ALL) {
+      this._log(messages);
+    }
+  }
+
+  _log(messages) {
+    for (let i = 0, n = messages.length; i < n; ++i) {
+      this._target.push(messages[i]);
+      this._target.flush("\n");
+    }
+  }
+}
+
+FeedbackLevels.THRESHOLD_ERROR = 0;
+FeedbackLevels.THRESHOLD_WARN = 1;
+FeedbackLevels.THRESHOLD_ALL = 2;
+/// </script>
+/// <script>
+/// export
+class FileCache {
+  constructor() {
+    this._blobs = new Map();
+  }
+
+  static normalizePath(path) {
+    if (path.startsWith("/")) return path.substr(("/").length);
+    if (path.startsWith("./")) return path.substr(("./").length);
+    return path;
+  }
+
+  store(blob, path) {
+    path = FileCache.normalizePath(path);
+    this._blobs.set(path, blob);
+  }
+
+  recall(path) {
+    path = FileCache.normalizePath(path);
+    return this._blobs.get(path);
+  }
+
+  list() {
+    return Array.from(this._blobs.keys());
+  }
+}
+/// </script>
+/// <script>
+/// import { AcknowledgeMint } from "./AcknowledgeMint.src";
+/// import { CLIParser } from "./CLIParser.src";
+/// import { CommonErrors } from "./CommonErrors.src";
+/// import { ErrorCommons } from "./ErrorCommons.src";
+/// import { FeedbackLevels } from "./FeedbackLevels.src";
+/// import { TextScanner } from "./TextScanner.src";
+/// import { TripleKit } from "./TripleKit.src";
+
+/// export
+class TrplktCommands {
+  constructor(system) {
+    this._system = system;
+
+    this.onbuild = null;
+    this.oncreatecredits = null;
+    this.ondecompile = null;
+    this.init = null;
+
+    TrplktCommands.initErrorHandlers(this, this._system);
+  }
+
+  static initDefinitions() {
+    const { BUILD } = TrplktCommands;
+    const { CREDITS } = TrplktCommands;
+    const { DECOMPILE } = TrplktCommands;
+    const { INIT } = TrplktCommands;
+    const { PUBLISH } = TrplktCommands;
+
+    let parser = new CLIParser();
+    parser.addCommand("build", (params) => {
+      parser.constrain("mode", BUILD);
+      parser.require("shunt", (params) => {
+        return "Shunting block is non-optional";
+      });
+    });
+    parser.addCommand("create-credits", (params) => {
+      parser.constrain("mode", CREDITS);
+      parser.require("flist", $needsFileName);
+    });
+    parser.addCommand("decompile", (params) => {
+      parser.constrain("mode", DECOMPILE);
+      parser.require("flist", $needsFileName);
+    });
+    parser.addCommand("init", (params) => {
+      parser.constrain("mode", INIT);
+      parser.require("flist", $needsFileName);
+    });
+    parser.addCommand("publish", (params) => {
+      parser.constrain("mode", PUBLISH);
+      parser.require("flist", $needsFileName);
+    });
+
+    parser.addDefaultCommand("build", (value) => {
+      return value.includes(".") || value.includes("/");
+    });
+
+    parser.addOption("-d", "--emit-dblocks", (params) => {
+      parser.check("mode", $wrongOptionForCommand, BUILD);
+    });
+    parser.addOption("-g", "--emit-gblocks", (params) => {
+      parser.check("mode", $wrongOptionForCommand, BUILD);
+    });
+    parser.addOption("-m", null, (params, value) => {
+      parser.check("mode", $wrongOptionForCommand, BUILD);
+      params.set("shunt", value);
+    });
+    parser.addOption("-o", null, (params, value) => {
+      parser.check("mode", $wrongOptionForCommand, BUILD, CREDITS);
+      params.set("outfile", value);
+    });
+    parser.addOption("-t", null, (params) => {
+      parser.check("mode", $wrongOptionForCommand, BUILD);
+      params.set("use-triplicate", true);
+    });
+    parser.addOption(null, "--verbose");
+    parser.addOption("-x", "--extract", (params, value) => {
+      parser.check("mode", $wrongOptionForCommand, DECOMPILE);
+      parser.addParamListItem("xlist", value);
+    });
+
+    parser.addOption("-f", null, (params, value) => {
+      if (params.get("mode") != BUILD) {
+        parser.constrain("flist", undefined, "Too many files specified");
+      }
+      parser.addParamListItem("flist", value);
+    });
+    parser.addDefaultOption("-f");
+    parser.addFinalizer((params) => {
+      if (params.get("mode") == BUILD && !params.has("shunt")) {
+        let flist = params.get("flist");
+        if (flist && flist.length == 1) {
+          params.set("shunt", flist.pop());
+        }
+      }
+    });
+
+    function $needsFileName() {
+      return "File name required"
+    }
+    function $wrongOptionForCommand(option) {
+      return (
+        "Invalid option '" + option + "' for command '" + parser.command + "'"
+      );
+    }
+
+    return parser;
+  }
+
+  execute(commandAndArgsString) {
+    let name, scanner = new TextScanner(commandAndArgsString);
+    let parts = [ name = this._getNextText(scanner) ];
+    if (!name) return Promise.resolve();
+    while (scanner.tip) {
+      let next = this._getNextText(scanner);
+      if (next) parts.push(next);
+    }
+
+    let parser = TrplktCommands.initDefinitions();
+    let params = parser.handle(parts);
+    if (!params) {
+      this._system.output.error(parser.error.message);
+      return Promise.reject(
+        new TrplktCommands.KnownFatalError(parser.error)
+      );
+    }
+    return this.executeStructuredCommand(parser.command, params);
+  }
+
+  executeStructuredCommand(name, params) {
+    if (params.get("verbose") && this._system.output) {
+      this._system.output.threshold = FeedbackLevels.THRESHOLD_ALL;
+    }
+
+    switch (name) {
+      case "build": return this._commandBuild(params);
+      case "create-credits": return this._commandCreateCredits(params);
+      case "decompile": return this._commandDecompile(params);
+      case "init": return this._commandInit(params);
+      case "publish": return this._commandPublish(params);
+    }
+    // NB: Not `KnownFatalError`.  (See error class comments.)
+    return Promise.reject(new Error("invalid command: " + name));
+  }
+
+  _dispatch(handler, ...args) {
+    if (handler) handler.apply(null, args);
+  }
+
+  _commandInit(params) {
+    let fileName = params.get("flist")[0];
+    let kit = new TripleKit(this._system);
+    return kit.init(fileName).then(() => {
+      this._dispatch(this.oninit, fileName);
+    });
+  }
+
+  _commandBuild(params) {
+    let $ = params.get.bind(params);
+    let kit = new TripleKit(this._system);
+
+    // TODO remove legacy
+    if ($("use-triplicate") != undefined) {
+      this._warn(
+        "Omit option --use-triplicate (-t); triplicate is used in all builds",
+        "(use command 'publish' on output; emitting g-blocks now)"
+      );
+    }
+
+    // TODO remove legacy
+    if ($("emit-dblocks") != undefined) {
+      this._warn(
+        "Option --emit-dblocks (-d) is deprecated; emitting g-blocks instead"
+      );
+    }
+
+    return kit.build($("flist"), $("shunt"), $("outfile")).then((path) => {
+      this._dispatch(this.onbuild, path);
+    }).catch((err) => (
+      this.$checkFileReadErrors(err) ||
+      this.$checkDialectErrors(err) ||
+      Promise.reject(err)
+    ));
+  }
+
+  _commandPublish(params) {
+    let fileName = params.get("flist")[0];
+    let kit = new TripleKit(this._system);
+    return kit.publish(fileName).then(() => {
+      this._dispatch(this.onpublish, fileName);
+    }).catch((err) => (
+      this.$checkFileReadErrors(err) ||
+      this.$checkDialectErrors(err) ||
+      Promise.reject(err)
+    ));
+  }
+
+  _warn(...messages) {
+    if (this._system.output) this._system.output.warn(...messages);
+  }
+
+  _commandCreateCredits(params) {
+    let $ = params.get.bind(params);
+    let [ inputPath ] = $("flist");
+    let outputPath = $("outfile");
+    let kit = new TripleKit(this._system);
+    return kit.createCredits(inputPath, outputPath).then(() => {
+      this._dispatch(this.oncreatecredits, outputPath);
+    }).catch((err) => (
+      this.$checkFileReadErrors(err) ||
+      this.$checkInvalidCreditsError(err) ||
+      Promise.reject(err)
+    ));
+  }
+
+  _commandDecompile(params) {
+    let $ = params.get.bind(params);
+    // assert(params.get("flist").length == 1)
+    let [ fileName ] = $("flist");
+    let extractions = $("xlist");
+    let kit = new TripleKit(this._system);
+    return kit.decompile(fileName, extractions).then((names) => {
+      this._dispatch(this.ondecompile, names);
+    }).catch((err) => (
+      this.$checkFileReadErrors(err) ||
+      this.$checkDialectErrors(err) ||
+      Promise.reject(err)
+    ));
+  }
+
+  _getNextText(scanner) {
+    let token = scanner.getToken();
+    return token && token.content;
+  }
+
+  static initErrorHandlers(commands, system) {
+    const { check } = TrplktCommands.KnownFatalError;
+
+    const { DialectError } = CommonErrors;
+    const { InputFormatError } = AcknowledgeMint;
+    const { NoFileSourceError } = TripleKit;
+    const { NoSuchFileError } = TripleKit;
+
+    commands.$checkFileReadErrors = (err) => {
+      if (!wrap) var wrap = check(err, NoFileSourceError, $noFileSource);
+      if (!wrap) var wrap = check(err, NoSuchFileError, $noSuchFile);
+      return wrap && Promise.reject(wrap);
+    }
+
+    commands.$checkInvalidCreditsError = (err) => {
+      var wrap = check(err, InputFormatError, $invalidCredits);
+      return wrap && Promise.reject(wrap);
+    }
+
+    commands.$checkDialectErrors = (err) => {
+      var wrap = check(err, DialectError, $syntaxIssue);
+      return wrap && Promise.reject(wrap);
+    }
+
+    function $invalidCredits(err) {
+      $log(err.message + ": " + err.path);
+    }
+
+    function $noFileSource(err) {
+      $log(err.message);
+    }
+
+    function $noSuchFile(err) {
+      $log(ErrorCommons.createNoSuchFileMessage(err));
+    }
+
+    function $syntaxIssue(err) {
+      $log(ErrorCommons.createSyntaxErrorMessage(err));
+    }
+
+    function $log(text) {
+      if (system.output) system.output.error(text);
+    }
+  }
+}
+
+// Use this for errors that are recognized as fatal and known to have already
+// been handled (with feedback to the user).  For other, unrecognized errors,
+// do not wrap them--just let them escape, and they'll be treated as fatal,
+// too, but with scarier, developer-oriented output.
+TrplktCommands.KnownFatalError = class KnownFatalError extends Error {
+  constructor(original) {
+    if (original instanceof TrplktCommands.KnownFatalError) {
+      return original;
+    }
+    super("Cannot proceed with operation");
+    this.original = original;
+  }
+
+  static check(err, kind, $handler = null) {
+    if (err instanceof TrplktCommands.KnownFatalError) {
+      return err;
+    }
+    if (err instanceof kind) {
+      if ($handler) $handler.call(null, err);
+      return new TrplktCommands.KnownFatalError(err);
+    }
+    return null;
+  }
+}
+
+TrplktCommands.DECOMPILE = -1;
+TrplktCommands.INIT = 0;
+TrplktCommands.BUILD = 1;
+TrplktCommands.PUBLISH = 2;
+
+TrplktCommands.CREDITS = 10;
+/// </script>
+/// <script>
+/// export
+class CLIParser {
+  constructor() {
+    this.params = null;
+    this.command = null;
+    this.error = null;
+
+    this._defaultCommand = null;
+    this._defaultOption = null;
+    this._finalizer = null;
+
+    this._commands = new Map();
+    this._longOptions = new Map();
+    this._shortOptions = new Map();
+
+    this._universalConstraints = [];
+  }
+
+  addCommand(name, callback) {
+    this._commands.set(name, { name: name, callback: callback });
+  }
+
+  addDefaultCommand(name, heuristic = null) {
+    let info = this._commands.get(name);
+    if (!info) throw new Error("Bad command");
+    this._defaultCommand = info;
+    if (heuristic) {
+      info.heuristic = heuristic;
+    }
+  }
+
+  addFinalizer(callback) {
+    this._finalizer = callback;
+  }
+
+  listCommands() {
+    let result = [];
+    for (let [ name ] of this._commands.entries()) {
+      result.push(name);
+    }
+    return result;
+  }
+
+  addOption(terse, verbose, callback = null) {
+    let name = this._getNameForLongOption(verbose);
+    if (verbose) {
+      if (!name) throw new Error("Bad format");
+      this._longOptions.set(verbose, { name: name, callback: callback });
+    }
+    if (terse) {
+      if (!this._isShort(terse)) throw new Error("Bad format");
+      this._shortOptions.set(terse, { name: name, callback: callback });
+    }
+  }
+
+  _getNameForLongOption(arg) {
+    if (arg && this._isLong(arg)) {
+      return arg.substring(("--").length);
+    }
+    return null;
+  }
+
+  _isShort(arg) {
+    const expectedLength = ("-").length + 1;
+    return arg.length == expectedLength && this._isOption(arg);
+  }
+
+  _isOption(arg) {
+    return arg.startsWith("-");
+  }
+
+  _isLong(arg) {
+    const minimumLength = ("--").length + 2;
+    return arg.length >= minimumLength && arg.startsWith("--");
+  }
+
+  constrain(name, value, message = null) {
+    if (this.params.has(name)) {
+      try {
+        this.check(name, null, value);
+      } catch (ex) {
+        if (ex instanceof CLIParser.ArgError) {
+          ex.message = message;
+        }
+        throw ex;
+      }
+    } else if (value !== undefined) {
+      this.params.set(name, value);
+    }
+  }
+
+  check(name, handler = null, ...candidates) {
+    if (candidates.indexOf(this.params.get(name)) < 0) {
+      throw new CLIParser.CheckFailure(
+        "Argument constraint violated", handler
+      );
+    }
+  }
+
+  addParamListItem(listName, value) {
+    let list = this.params.get(listName) || [];
+    if (!list.length) this.params.set(listName, list);
+    list.push(value);
+  }
+
+  addDefaultOption(option, name = null) {
+    if (!this._isShort(option)) {
+      throw new Error("Bad format");
+    }
+    this._defaultOption = option;
+    if (name) {
+      this.require(name);
+      this.addOption(option, this._prefix(name), (params, value) => {
+        this.constrain(name, undefined);
+        params.set(name, value);
+      });
+    }
+  }
+
+  require(param, message = null) {
+    this._universalConstraints.push(() => {
+      if (!this.params.has(param)) {
+        if (typeof(message) == "function") {
+          message = message.call(null, this.params);
+        } else if (!message) {
+          message = "Parameter " + JSON.stringify(param) + " is required";
+        }
+        throw new CLIParser.ArgError(message);
+      }
+    });
+  }
+
+  handle(args) {
+    this.params = new Map();
+    try {
+      let optionsPosition = 0;
+      if (this._commands.size) {
+        let info = null;
+        if (args.length > 0) {
+          if (this._commands.has(args[0])) {
+            info = this._commands.get(args[0]);
+            ++optionsPosition;
+          } else {
+            if (this._defaultCommand) {
+              let { heuristic } = this._defaultCommand;
+              if (this._isOption(args[0]) ||
+                  (heuristic && heuristic.call(null, args[0]))) {
+                info = this._defaultCommand;
+              }
+            } else if (!this._isOption(args[0])) {
+              throw this._argUnrecognized(args[0]);
+            }
+          }
+        }
+
+        if (info) {
+          this.command = info.name;
+          info.callback(this.params);
+        } else {
+          throw this._argExpected(null);
+        }
+      }
+      for (let i = optionsPosition, n = args.length; i < n; ++i) {
+        if (this._isOption(args[i])) {
+          i += this._parseArguments(this.params, args, i);
+        } else if (this._defaultOption != null) {
+          this._parseArguments(this.params, [ this._defaultOption, args[i] ]);
+        } else {
+          throw this._argUnrecognized(args[i]);
+        }
+      }
+      if (this._finalizer) {
+        (this._finalizer)(this.params);
+      }
+      for (let i = 0, n = this._universalConstraints.length; i < n; ++i) {
+        (this._universalConstraints[i])();
+      }
+      return this.params;
+    } catch (ex) {
+      if (ex instanceof CLIParser.ArgError) {
+        this.error = ex;
+        return this.params = null;
+      }
+      throw (ex);
+    }
+  }
+
+  _parseArguments(params, args, index = 0) {
+    if (this._isLong(args[index])) {
+      return this._parseLongOption(params, args, index);
+    }
+    return this._parseShortOptions(params, args, index);
+  }
+
+  _parseLongOption(params, args, index) {
+    let name, value, spec = args[index].substring(2);
+    [ name ] = spec.split("=", 1);
+    let skipCount = 0;
+    let info = this._longOptions.get(this._prefix(name));
+    if (!info) throw this._argUnrecognized(this._prefix(name));
+    if (info.callback && info.callback.length > 1) {
+      if (name.length == spec.length) {
+        value = args[index + 1];
+        ++skipCount;
+      } else {
+        value = spec.substring(spec.indexOf("=") + 1);
+      }
+      if (!value) {
+        throw this._argExpected(name);
+      }
+      this._invokeOptionCallback(info, name, params, value);
+    } else {
+      if (name.length != spec.length) {
+        throw this._argExpected(name, false);
+      }
+      this._invokeOptionCallback(info, name, params);
+      this._setBoolArg(params, info.name);
+    }
+    return skipCount;
+  }
+
+  _invokeOptionCallback(info, option, params, ...args) {
+    if (info.callback) {
+      // NB: `option` may be long or short but is expected to be unprefixed.
+      try {
+        info.callback(params, ...args);
+      } catch (ex) {
+        if ((ex instanceof CLIParser.CheckFailure) && ex.handler) {
+          ex.message = ex.handler(this._prefix(option));
+        }
+        throw ex;
+      }
+    }
+  }
+
+  _setBoolArg(params, name) {
+    if (name && !params.has(name)) {
+      params.set(name, true);
+    }
+  }
+
+  _parseShortOptions(params, args, index) {
+    let skipCount = 0;
+    // assert(args[index].charAt(0) == "-");
+    let optionSequence = args[index].substring(1);
+    for (let i = 0, n = optionSequence.length; i < n;) {
+      let codePoint = String.fromCodePoint(optionSequence.codePointAt(i));
+      let info = this._shortOptions.get("-" + codePoint);
+      if (!info) throw this._argUnrecognized("-" + codePoint);
+      if (info.callback && info.callback.length > 1) {
+        let shortOptionMnemonicIsInTailPosition = (i + codePoint.length) == n;
+        if (!(index + 1 < args.length) || this._isOption(args[index + 1]) ||
+            !shortOptionMnemonicIsInTailPosition) {
+          throw this._argExpected(codePoint);
+        }
+        this._invokeOptionCallback(info, codePoint, params, args[index + 1]);
+        ++skipCount;
+      } else {
+        this._invokeOptionCallback(info, codePoint, params);
+        if (info.name != null) {
+          this._setBoolArg(params, info.name);
+        }
+      }
+      i += codePoint.length;
+    }
+    return skipCount;
+  }
+
+  _argUnrecognized(prefixed) {
+    return new CLIParser.ArgError(
+      "Unrecognized option \"" + prefixed + "\""
+    );
+  }
+
+  _argExpected(name, needsArg = true) {
+    let message, prefixed = this._prefix(name);
+    if (name === null) {
+      message = "Expected command name as an argument";
+    } else if (needsArg) {
+      message = "Option \"" + prefixed + "\" expects an argument"
+    } else {
+      message = "Option \"" + prefixed + "\" expects no argument"
+    }
+    return new CLIParser.ArgError(message);
+  }
+
+  _prefix(name) {
+    if (name) {
+      if (this._isOption(name)) {
+        throw new Error("Internal error; there is a bug in CLIParser");
+      }
+      if (name.length > 1) {
+        return "--" + name;
+      }
+      return "-" + name;
+    }
+    return null;
+  }
+}
+
+CLIParser.ArgError = class ArgError extends Error { };
+
+CLIParser.CheckFailure = class CheckFailure extends CLIParser.ArgError {
+  constructor(message, handler) {
+    super(message);
+    this.handler = handler;
+  }
+}
+/// </script>
+/// <script>
+/// import { SimpleScanner } from "./SimpleScanner.src";
+
+/// export
+class TextScanner extends SimpleScanner {
+  getToken() {
+    do {
+      var result = this.getGenericToken();
+    } while (result && result.type == TextScanner.WHITESPACE);
+    if (result && result.type == SimpleScanner.UNKNOWN) {
+      result.content = this._scanText();
+      result.type = TextScanner.TEXT;
+    }
+    return result;
+  }
+
+  static from(ref, position = ref.position) {
+    let result = new TextScanner(ref.text);
+    result.position = position;
+    return result;
+  }
+
+  _scanText() {
+    let result = "";
+    while (this.tip && !this.isWhitespace(this.tip)) {
+      result += this.readCodePoint();
+    }
+    return result;
+  }
+}
+
+TextScanner.WHITESPACE = SimpleScanner.WHITESPACE;
+TextScanner.TEXT = 1;
+/// </script>
+/// <script>
+/// import { FileCache } from "./FileCache.src";
+
+/// export
+class WebkitFileIngester {
+  static cache(fileList, cache = new FileCache()) {
+    if (!fileList.length) return null;
+
+    let $prefixOf = (path) => path.substr(0, path.indexOf("/", 1));
+    let prefix = $prefixOf(fileList[0].webkitRelativePath);
+    for (let i = 0; i < fileList.length; ++i) {
+      // assert($prefixOf(fileList[i].webkitRelativePath) == prefix)
+      let path = fileList[i].webkitRelativePath.substr(prefix.length);
+      cache.store(fileList[i], path);
+    }
+
+    return cache;
+  }
+
+  static readBlob(blob, raw = false) {
+    if (!blob) return Promise.resolve(null);
+    if (typeof(FileReader) != "undefined") {
+      let reader = new FileReader();
+      return new Promise(function(resolve) {
+        reader.addEventListener("loadend", resolve);
+        if (raw) {
+          reader.readAsArrayBuffer(blob);
+        } else {
+          reader.readAsText(blob);
+        }
+      }).then(function(event) {
+        return event.target.result;
+      });
+    }
+    throw new Error("FileReader API not implemented");
+  }
+}
+/// </script>
+/// <script>
+/// import { credits } from "./credits.src";
+
+// NB: This module should not be distributed alone as-is without taking care
+// to include appropriate notices and license terms for routines derived from
+// code with third-party authorship.
+//
+// Refer to ACKNOWLEDGEMENTS.txt (for trplkt; "CRC-32").
+
+/// export
+class ZodLib {
+  addFile(name, contents) {
+    this._fileBuffers.set(name, contents);
+  }
+
+  constructor(fileBuffers) {
+    if (!(this instanceof ZodLib.Container)) {
+      throw new Error("Not permitted; use ZodLib.createArchive");
+    }
+    this._fileBuffers = fileBuffers;
+  }
+
+  static createArchive() {
+    return new ZodLib.Container(new Map);
+  }
+
+  zip() {
+    // For info on the file format, refer to:
+    // - <https://www.pkware.com/documents/APPNOTE/APPNOTE-6.2.0.txt>
+    // - <https://www.pkware.com/documents/APPNOTE/APPNOTE-2.0.txt>
+
+    const fileHeaderMinSize = 30;
+    const directoryRecordMinSize = 46;
+    const directoryTerminatorMinSize = 22;
+
+    // Before we can allocate the output buffer, we'll have to compute some
+    // things, including what size buffer is required.
+    let filesSize = 0;
+    let directorySize = 0;
+    let fileNames = this._listFileNames();
+    for (let i = 0, n = fileNames.length; i < n; ++i) {
+      let name = fileNames[i];
+      let size = this._fileBuffers.get(name).byteLength;
+      filesSize += fileHeaderMinSize + name.length + size;
+      directorySize += directoryRecordMinSize + name.length;
+    }
+
+    let totalSize = filesSize + directorySize + directoryTerminatorMinSize;
+    let output = new ArrayBuffer(totalSize);
+
+    const filesStartOffset = 0;
+    const directoryStartOffset = 0 + filesSize;
+
+    let filesWriter = new ZodLib.Writer(output, filesStartOffset);
+    let directoryWriter = new ZodLib.Writer(output, directoryStartOffset);
+
+    const fileHeaderSignature = 0x04034B50;
+    const directoryHeaderSignature = 0x02014B50;
+    const directoryTerminatorSignature = 0x06054B50;
+    const zipVersion = 20;
+    const flags = 0;
+
+    let table = ZodLib.createCRC32Table();
+    for (let i = 0, n = fileNames.length; i < n; ++i) {
+      let name = fileNames[i];
+      let buffer = this._fileBuffers.get(name);
+      let crc32 = ZodLib.computeCRC32(buffer, 0, table);
+
+      let time = 0; // TODO
+
+      let headerOffset = filesWriter.offset;
+
+      filesWriter.put4Bytes(fileHeaderSignature);
+      filesWriter.put2Bytes(zipVersion);
+      filesWriter.put2Bytes(flags);
+      filesWriter.put2Bytes(ZodLib.STORE_METHOD);
+
+      filesWriter.put4Bytes(time);
+
+      filesWriter.put4Bytes(crc32);
+      filesWriter.put4Bytes(buffer.byteLength);
+      filesWriter.put4Bytes(buffer.byteLength);
+      filesWriter.put2Bytes(name.length);
+
+      filesWriter.put2Bytes(0); // extra size
+
+      filesWriter.putStringBytes(name);
+
+      filesWriter.putBufferBytes(buffer);
+
+      directoryWriter.put4Bytes(directoryHeaderSignature);
+      directoryWriter.put2Bytes(zipVersion);
+      directoryWriter.put2Bytes(zipVersion);
+      directoryWriter.put2Bytes(flags);
+      directoryWriter.put2Bytes(ZodLib.STORE_METHOD);
+
+      directoryWriter.put4Bytes(time);
+
+      directoryWriter.put4Bytes(crc32);
+      directoryWriter.put4Bytes(buffer.byteLength);
+      directoryWriter.put4Bytes(buffer.byteLength);
+      directoryWriter.put2Bytes(name.length);
+
+      directoryWriter.put2Bytes(0); // extra size
+      directoryWriter.put2Bytes(0); // comment size
+      directoryWriter.put2Bytes(0); // disk number
+      directoryWriter.put2Bytes(0); // internal attributes
+      directoryWriter.put4Bytes(0); // external attributes
+
+      directoryWriter.put4Bytes(headerOffset);
+
+      directoryWriter.putStringBytes(name);
+    }
+
+    // assert(directoryWriter.offset - directoryStartOffset == directorySize)
+
+    directoryWriter.put4Bytes(directoryTerminatorSignature);
+    directoryWriter.put2Bytes(0); // current disk
+    directoryWriter.put2Bytes(0); // directory disk
+    directoryWriter.put2Bytes(fileNames.length);
+    directoryWriter.put2Bytes(fileNames.length);
+    directoryWriter.put4Bytes(directorySize);
+    directoryWriter.put4Bytes(directoryStartOffset);
+
+    directoryWriter.put2Bytes(0); // comment size
+
+    return output;
+  }
+
+  _listFileNames() {
+    return Array.from(this._fileBuffers.keys());
+  }
+
+  // CRC-32 routines (derived from zlib / pako; see zlib notices)
+
+  static computeCRC32(buffer, crc = 0, table = ZodLib.createCRC32Table()) {
+    crc ^= -1;
+
+    let bytes = new Uint8Array(buffer);
+    for (let i = 0, n = bytes.byteLength; i < n; i++) {
+      crc = (crc >>> 8) ^ table[(crc ^ bytes[i]) & 0xFF];
+    }
+
+    return (crc ^ (-1)) >>> 0;
+  }
+
+  static createCRC32Table() {
+    var c, table = [];
+
+    for (var n = 0; n < 256; n++) {
+      c = n;
+      for (var k = 0; k < 8; k++) {
+        c = ((c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1));
+      }
+      table[n] = c;
+    }
+
+    return table;
+  }
+}
+
+// NB: for internal use only
+ZodLib.Container = class Container extends ZodLib { };
+
+ZodLib.Writer = class Writer {
+  constructor(buffer, offset) {
+    this._data = new DataView(buffer);
+    this.offset = offset;
+  }
+
+  put2Bytes(value) {
+    this._data.setUint16(this.offset, value, true);
+    this.offset += 2;
+  }
+
+  put4Bytes(value) {
+    this._data.setUint32(this.offset, value, true);
+    this.offset += 4;
+  }
+
+  putBufferBytes(buffer) {
+    let srcBytes = new Uint8Array(buffer);
+    let destBytes = new Uint8Array(this._data.buffer);
+    destBytes.set(srcBytes, this.offset);
+    this.offset += buffer.byteLength;
+  }
+
+  putStringBytes(string) {
+    Writer.syncStringToBuffer(string, this._data.buffer, this.offset);
+    this.offset += string.length;
+  }
+
+  static syncStringToBuffer(text, buffer, offset) {
+    let bytes = new Uint8Array(buffer, offset);
+    for (let i = 0, n = text.length; i < n; ++i) {
+      let unit = text.codePointAt(i);
+      if (unit != unit & 0x7F) throw new Error("not ASCII"); // TODO
+      bytes[i] = unit;
+    }
+  }
+}
+
+ZodLib.STORE_METHOD = 0;
+/// </script>
+/// <script>
+/// export ...
+var credits =
+` ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' '
+The primary work is trplkt (0.12.0).
+Available under MIT License, unless otherwise noted.
+
+NB: Any auxiliary development tools, including but not limited to those
+distributed alongside the project source code and used to build the primary
+work, are separate works used under license compatible with this use and are
+not considered a part of the primary work.
+
+The primary work also incorporates elements from other works, which are
+indentified below.
+
+(The preceding notes are informational, and reproducing them is not itself
+intended to be a prerequisite for redistribution, although the inclusion of
+some of the content below may be required in order to redistribute the primary
+work in whole or in part.)
+
+Authorship and contributions
+============================
+
+* Andrey Tupitsin
+* Colby Russell
+* Jean-loup Gailly
+* Mark Adler
+* Vitaly Puzrin
+
+Additional works involved
+=========================
+
+CRC-32 routines (derived from zlib / pako) available under zlib license
+
+    Copyright (C) 1995-2013 Jean-loup Gailly and Mark Adler
+    Copyright (C) 2014-2017 Vitaly Puzrin and Andrey Tupitsin
+
+<https://zlib.net>
+<https://github.com/nodeca/pako>
+
+Licenses compatible for use in the primary work
+===============================================
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+* * *
+
+The zlib license
+
+This software is provided 'as-is', without any express or implied
+warranty.  In no event will the authors be held liable for any damages
+arising from the use of this software.
+
+Permission is granted to anyone to use this software for any purpose,
+including commercial applications, and to alter it and redistribute it
+freely, subject to the following restrictions:
+
+1. The origin of this software must not be misrepresented; you must not
+   claim that you wrote the original software. If you use this software
+   in a product, an acknowledgment in the product documentation would be
+   appreciated but is not required.
+2. Altered source versions must be plainly marked as such, and must not be
+   misrepresented as being the original software.
+3. This notice may not be removed or altered from any source distribution.
+' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' `
+/// </script>
+/// <script>
+/// import { AcknowledgeMint } from "./AcknowledgeMint.src";
+/// import { CLIParser } from "./CLIParser.src";
+/// import { CommonErrors } from "./CommonErrors.src";
+/// import { ConsoleOutput } from "./ConsoleOutput.src";
+/// import { FeedbackLevels } from "./FeedbackLevels.src";
+/// import { FileNodeFSAdapter } from "./FileNodeFSAdapter.src";
+/// import { SystemA } from "./SystemA.src";
+/// import { TripleKit } from "./TripleKit.src";
+/// import { TrplktCommands } from "./TrplktCommands.src";
+/// import { credits } from "./credits.src";
+
+/// export
+class SystemC extends SystemA {
+  constructor() {
+    super();
+
+    if (typeof(process) == "undefined" || typeof(module) == "undefined") {
+      throw new SystemA.ShuntingError("Not a NodeJS environment");
+    }
+
+    if (process.argv.indexOf("--version") >= 0) {
+      console.log(credits);
+      process.exit(0);
+    }
+
+    const fs = module.require("fs");
+    const path = module.require("path");
+
+    this._process = process;
+
+    let [ engine, script, ...eargs ] = process.argv;
+    this._engine = engine;
+    this._script = script;
+    this._args = eargs;
+
+    this.input = null;
+    let simutype = new ConsoleOutput({
+      printLine: (text) => void(console.log(text))
+    });
+    this.output = new FeedbackLevels(simutype);
+
+    this._files = new FileNodeFSAdapter(fs, path);
+
+    this._cli = TrplktCommands.initDefinitions();
+
+    this.$getOwnSource = () => (
+      fs.readFileSync(module.filename, { encoding: "utf8" })
+    );
+  }
+
+  get identity() {
+    return this.$getOwnSource();
+  }
+
+  run() {
+    this._processArguments(this._cli, this._args).then(() => {
+      this._process.exit(SystemC.EXIT_SUCCESS);
+    }).catch((err) => {
+      if (err instanceof TrplktCommands.KnownFatalError) {
+        var fatal = err;
+        err = err.original;
+      }
+      if (err instanceof CLIParser.ArgError) {
+        console.log(err.message + "\n");
+        let commandList = "";
+        let commands = this._cli.listCommands();
+        for (let i = 0, n = commands.length; i < n; ++i) {
+          commandList += "    " + commands[i] + "\n";
+        }
+        let engine = this._engine.substr(this._engine.lastIndexOf("/") + 1);
+        let script = this._script.substr(this._script.lastIndexOf("/") + 1);
+        console.log(
+          "Usage: " + engine + " " + script + " <command> FILE" + "\n\n" +
+          "Available commands:" + "\n\n" + commandList
+        );
+        var status = SystemC.EXIT_BADARGS;
+      } else if (err instanceof AcknowledgeMint.InputFormatError) {
+        var status = SystemC.EXIT_BADTEXT;
+      } else if (err instanceof TripleKit.NoSuchFileError) {
+        var status = SystemC.EXIT_BADFILE;
+      } else if (err instanceof CommonErrors.DialectError) {
+        var status = SystemC.EXIT_BADTEXT;
+      } else {
+        console.error("Unrecognized error:", err);
+        var status = SystemC.EXIT_EXECERR;
+      }
+
+      if (fatal == undefined) {
+        console.error("Unhandled error:", err);
+        status = SystemC.EXIT_EXECERR;
+      }
+      this._process.exit(status);
+    });
+  }
+
+  _processArguments(parser, args) {
+    const { KnownFatalError } = TrplktCommands;
+    let params = parser.handle(args);
+    if (params) {
+      let commands = new TrplktCommands(this);
+      return commands.executeStructuredCommand(parser.command, params);
+    }
+    return Promise.reject(
+      KnownFatalError.check(parser.error, CLIParser.ArgError) ||
+      parser.error
+    );
+  }
+
+  read(path) {
+    return this._files.read(path).catch((err) => {
+      return this._wrapFSError(err, path);
+    });
+  }
+
+  write(path, contents) {
+    return this._files.write(path, contents).catch((err) => {
+      return this._wrapFSError(err, path);
+    });
+  }
+
+  _wrapFSError(nodeError, path) {
+    switch (nodeError.code) {
+      case "ENOENT":
+        return Promise.reject(new TripleKit.NoSuchFileError(path));
+      break;
+    }
+    return Promise.reject(nodeError);
+  }
+}
+
+SystemC.EXIT_EXECERR = -1;
+SystemC.EXIT_SUCCESS = 0;
+SystemC.EXIT_BADARGS = 1;
+SystemC.EXIT_BADFILE = 2;
+
+SystemC.EXIT_BADTEXT = 10;
+/// </script>
+/// <script>
+/// export
+class FileNodeFSAdapter {
+  constructor(fs, path, workDir = ".") {
+    this._nodeFS = fs;
+    this._nodePath = path;
+    this._workDir = workDir;
+  }
+
+  read(path) {
+    if (!path.startsWith("/")) {
+      path = this._nodePath.join(this._workDir, path);
+    }
+    const options = { encoding: "utf8" };
+    return new Promise((resolve, reject) => {
+      void this._nodeFS.readFile(path, options, (err, contents) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve(contents);
+        }
+      });
+    });
+  }
+
+  write(path, contents) {
+    if (!path.startsWith("/")) {
+      path = this._nodePath.join(this._workDir, path);
+    }
+    let parent = path.substr(0, path.lastIndexOf("/"));
+    return new Promise((resolve, reject) => {
+      try {
+        if (parent) this._forceDirectory(parent);
+      } catch (ex) {
+        return void(reject(ex));
+      }
+      this._nodeFS.writeFile(path, contents, (err) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve();
+        }
+      });
+    });
+  }
+
+  _forceDirectory(path) {
+    let stats = this._stat(path);
+    if (stats) {
+      if (stats.isDirectory()) return;
+      throw new Error("not a directory");
+    }
+    let parent = path.substr(0, path.lastIndexOf("/"));
+    if (parent) this._forceDirectory(parent);
+    this._nodeFS.mkdirSync(path);
+  }
+
+  _stat(path) {
+    try {
+      return this._nodeFS.statSync(path);
+    } catch (ex) {
+      return null;
+    }
+  }
+}
+/// </script>
+/// <script>
+/// import { TripleKit } from "./src/TripleKit.src";
+
+/// import { SystemA } from "./src/SystemA.src";
+/// import { SystemB } from "./src/SystemB.src";
+/// import { SystemC } from "./src/SystemC.src";
+/// import { TrplktCommands } from "./src/TrplktCommands.src";
+
+void function main() {
+  if (typeof(__FORCE_LIB__) != "undefined") {
+    if (typeof(module) != "undefined" && "exports" in module) {
+      module.exports.TripleKit = TripleKit;
+      module.exports.TrplktCommands = TrplktCommands;
+    } else {
+      throw new SystemA.ShuntingError("No CommonJS-style `module` here");
+    }
+  } else {
+    if (!system) var system = SystemA.create(SystemB);
+    if (!system) var system = SystemA.create(SystemC);
+    if (!system) throw SystemA.ShuntingError("Unknown environment");
+
+    system.run();
+  }
+} ();
+/// </script>
