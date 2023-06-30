@@ -35,6 +35,7 @@ class HAR2JSONUtil {
     this._cache = new Map();
     this._items = null;
     this._scraper = null;
+    this._outputPath = null;
 
     this._onReadyForReads = null;
     this._archiveCaptureReadiness = new Promise(($unblock) => {
@@ -42,8 +43,9 @@ class HAR2JSONUtil {
     });
   }
 
+  // XXX The control flow/handling around this is pretty derpy...
   setOutputFile(path) {
-    throw Error("unsupported"); // XXX
+    this._outputPath = path;
   }
 
   delegateTo($$OutageDataAgent) {
@@ -51,7 +53,7 @@ class HAR2JSONUtil {
   }
 
   // NB: This is a void method; main.src depends on it having no return value.
-  async run(inputPath, outputPath = "output.json", scraper = this._scraper) {
+  async run(inputPath, defaultName = "output.json", scraper = this._scraper) {
     const { NoSuchFileError } = this._system;
 
     const { $actuallyReadFileContents } = this;
@@ -66,7 +68,16 @@ class HAR2JSONUtil {
     // This unblocks the scraper so it can finish initialization.
     this._onReadyForReads();
 
-    let outages = await scraper.fetchData();
+    let listOfOutages = await scraper.fetchData();
+
+    if (!this.outputPath) {
+      this._outputPath = defaultName;
+    }
+
+    // TODO This should be pretty-printed.
+    return await this._system.write(
+      this._outputPath, JSON.stringify(listOfOutages)
+    );
   }
 
   // By implementing this method, we conform to the interface expected by the
