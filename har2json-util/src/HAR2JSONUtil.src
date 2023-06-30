@@ -69,9 +69,17 @@ class HAR2JSONUtil {
     let outages = await scraper.fetchData();
   }
 
+  // By implementing this method, we conform to the interface expected by the
+  // scraper impl of its `read`-able data source.  See `delegateTo`.
   async read(name) {
     await this._archiveCaptureReadiness;
 
+    // To underscore the significance of the abstraction in use here, we
+    // delegate to an internal method with a more explicit name.
+    return this._requestSimulatedFileOrGetFromCache(name);
+  }
+
+  async _requestSimulatedFileOrGetFromCache(name) {
     const { ReadResult } = HAR2JSONUtil;
 
     let hits = this._items.filter((x) => {
