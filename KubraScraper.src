@@ -114,7 +114,7 @@ class KubraScraper extends DeltaScraper {
       "fetching " + String(this.totalDownloaded / 1000) + " KB."
     );
 
-    return Array.from(outages);
+    return Array.from(outages.values());
   }
 
   // NB: This goes by the unfortunate name `_fetch_data` in the original.
@@ -146,7 +146,7 @@ class KubraScraper extends DeltaScraper {
       for (let j = 0, n = json["file_data"].length; j < n; ++j) {
         let o = json["file_data"][j];
         this.print(o);
-        if ("cluster" in o["desc"]) {
+        if (o["desc"]["cluster"]) {
           let nextZoom = zoom + 1;
           if (nextZoom > KubraScraper.MAX_ZOOM) {
             this.print(
@@ -158,18 +158,18 @@ class KubraScraper extends DeltaScraper {
           } else {
             this.print("Zooming in. Going to:", nextZoom);
             let child = this._getQuadkeyForPoint(o["geom"]["p"][0], nextZoom);
-            outages = new Map(
+            outages = new Map([
               ...(await this._visit([ child ], old, nextZoom, true)),
               ...outages
-            );
+            ]);
           }
         } else {
           this.print("Looking for neighbors");
           let neighbors = this._getNeighboringQuadkeys(quadkeys[i]);
-          outages = new Map(
+          outages = new Map([
             ...(await this._visit(neighbors, old, zoom)),
             ...outages
-          );
+          ]);
 
           let outageInfo = this._getOutageInfo(o, url);
           outages.set(outageInfo.id, outageInfo);
