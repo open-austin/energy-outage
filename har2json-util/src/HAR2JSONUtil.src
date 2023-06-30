@@ -60,7 +60,7 @@ class HAR2JSONUtil {
     try {
       this._items = JSON.parse(contents)["log"]["entries"];
     } catch (ex) {
-      throw ex; // XXX
+      throw (this.log("The input file isn't valid JSON!"), ex); // XXX
     }
 
     // This unblocks the scraper so it can finish initialization.
