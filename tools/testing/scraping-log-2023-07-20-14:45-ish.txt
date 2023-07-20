@@ -1,0 +1,11 @@
+colby@saporo-solanum:~/projects/open-austin/energy-outage/.../x$ python3 ./scrape_all.py
+>>>>>url https://kubra.io/stormcenter/api/v1/stormcenters/dd9c446f-f6b8-43f9-8f80-83f5245c60a1/views/76446308-a901-4fa3-849c-3dd569933a51/currentState?preview=false
+>>>>>url https://kubra.io/stormcenter/api/v1/stormcenters/dd9c446f-f6b8-43f9-8f80-83f5245c60a1/views/76446308-a901-4fa3-849c-3dd569933a51/configuration/c114b5fd-df28-4990-9b5c-965d85ced92f?preview=false
+>>>>>url https://kubra.io/data/1e46086d-49ec-459d-abe6-4a5b92c8892c/public/summary-1/data.json
+>>>>>url https://kubra.io/regions/1798994f-6f9d-4467-a548-a0a1962be36e/9c80a417-0d03-4486-8df8-329d0dcd27d1/serviceareas.json
+>>>>>url https://kubra.io/cluster-data/103/20d293c6-08fd-41b3-b96b-d2f522c74990/1e46086d-49ec-459d-abe6-4a5b92c8892c/public/cluster-1/0231301.json
+ https://kubra.io/cluster-data/103/20d293c6-08fd-41b3-b96b-d2f522c74990/1e46086d-49ec-459d-abe6-4a5b92c8892c/public/cluster-1/0231301.json Is cluster search?: False Tile: Tile(x=29, y=52, z=7)
+ Not found
+ Returning
+Made 5 requests, fetching 40.798 KB.
+[]

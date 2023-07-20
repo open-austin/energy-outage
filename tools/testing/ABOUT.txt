@@ -1,0 +1,12 @@
+The following files contain the logs of a modified version of the Python
+scraper running against the instance powering outagemap.austinenergy.com,
+except the logs include all the URLs that the scraper requested.
+
+  - scraping-log-2023-07-20-11:30-ish.txt
+  - scraping-log-2023-07-20-11:45-ish.txt
+  - scraping-log-2023-07-20-13:30-ish.txt
+  - scraping-log-2023-07-20-14:45-ish.txt
+
+These can be used with kubrascraperlog2fetchsnippet.app.htm (located in the
+parent directory) to output a fetch.js script which is in turn helpful for
+creating new HAR captures.  Refer to the comments at the top of that file.
