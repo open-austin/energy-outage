@@ -1,4 +1,4 @@
-import { HAR2JSONUtil } from "./src/HAR2JSONUtil.src";
+import { KHAR2JSONUtil } from "./src/KHAR2JSONUtil.src";
 
 import { SystemA } from "./src/SystemA.src";
 import { SystemB } from "./src/SystemB.src";
@@ -9,7 +9,7 @@ void function main() {
   if (!system) var system = SystemA.create(SystemC);
   if (!system) throw SystemA.ShuntingError("Unknown environment");
 
-  system.setUpForExec(HAR2JSONUtil).then((converter) => {
+  system.setUpForExec(KHAR2JSONUtil).then((converter) => {
     converter.delegateTo(AustinEnergyScraper);
 
     let [ inputPath, ...opt ] = system.getProgramArguments();

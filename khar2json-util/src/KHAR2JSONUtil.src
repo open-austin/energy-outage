@@ -1,4 +1,4 @@
-// har2json is a utility that converts a HAR network capture into the format
+// khar2json is a utility that converts a HAR network capture into the format
 // output by the Kubra scraper <https://github.com/codeforkyana/kubra-scraper>
 // by Code for Kentuckiana.
 //
@@ -8,16 +8,16 @@
 // it's trying to read is coming in live over the network versus from the
 // local file system versus a simulacrum that presents a network- or file-like
 // abstraction but works in some unknown-to-the-scraper way.  That's where
-// har2json comes in.
+// khar2json comes in.
 //
-// When the har2json utility is built and the scraper is linked in, this class
+// When khar2json is built and the scraper is linked in, class `KHAR2JSONUtil`
 // provides a way to perform simulated read operations that successfully
 // complete (or not) based on the contents of a HAR capture.  This is not
 // unlike the `HARMockServer`-based testing strategy; refer to the `tests/`
 // directory.
 //
 // (An actual scraper, however, is generally intended to make real network
-// requests to harvest the relevant data, of course.  The har2json utility in
+// requests to harvest the relevant data, of course.  The khar2json utility in
 // that case is not especially helpful, but the abstraction that allows the
 // heart of the scraper to be agnostic to whether it's running as part of a
 // conversion utility or not also allows the scraper to be hoisted into a
@@ -25,7 +25,7 @@
 // to work with live data coming over the wire via real network requests.)
 
 export
-class HAR2JSONUtil {
+class KHAR2JSONUtil {
   constructor(system, asyncReadFileHelper = null) {
     this._system = system;
     if (!this.$actuallyReadFileContents) {
@@ -91,7 +91,7 @@ class HAR2JSONUtil {
   }
 
   async _requestSimulatedFileOrGetFromCache(name) {
-    const { ReadResult } = HAR2JSONUtil;
+    const { ReadResult } = KHAR2JSONUtil;
 
     let hits = this._items.filter((x) => {
       return x.request.url == name && x.request.method == "GET"
@@ -116,7 +116,7 @@ class HAR2JSONUtil {
 // XXX This is not the best interface, but (at least for the time being) we're
 // trying to stick as closely as possible to the way the original scraper was
 // implemented, and that means matching a subset of the Python requests API.
-HAR2JSONUtil.ReadResult = class ReadResult {
+KHAR2JSONUtil.ReadResult = class ReadResult {
   static from(other) {
     return new Result(other.selection, other.status);
   }

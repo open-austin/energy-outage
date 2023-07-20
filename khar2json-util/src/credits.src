@@ -1,6 +1,6 @@
 export var credits =
 ` ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' '
-har2json
+khar2json
 
 NB: Any auxiliary development tools, including but not limited to those
 distributed alongside the project source code and used to build the primary
