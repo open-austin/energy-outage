@@ -18,15 +18,12 @@ void function main() {
       converter.setOutputFile(outputPath);
     }
 
-    let nu = converter.run(inputPath);
+    return converter.run(inputPath).then($finish);
+  }).catch($finish);
 
-    nu.then($finish);
-    nu.catch($finish);
-
-    function $finish(err = null) {
-      system.finish(converter, err);
-    }
-  });
+  function $finish(err = null) {
+    system.finish(err);
+  }
 } ();
 
 import { AustinEnergyScraper } from "../AustinEnergyScraper.src";

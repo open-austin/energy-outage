@@ -104,7 +104,7 @@ class SystemB extends SystemA {
     $unblock(app);
   }
 
-  finish(app, err = null) {
+  finish(err = null) {
     if (err) {
       throw err; // XXX
     } else if (!this._fileName) {

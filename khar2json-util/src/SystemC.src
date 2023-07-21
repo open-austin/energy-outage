@@ -47,19 +47,14 @@ class SystemC extends SystemA {
     return Promise.reject(new SystemC.ArgError);
   }
 
-  finish(app, err = null) {
+  finish(err = null) {
     if (err) {
       const { NoSuchFileError } = SystemA;
       if (err instanceof SystemC.ArgError) {
-        this._report(err.message);
-
-        // If we were supporting interactive commands, here we could also do:
-        //
-        //   this._report(
-        //     "Usage: " + engine + " " + script + " <command> FILE" + "\n" +
-        //     "Available commands:" + "\n\n" + commandList
-        //   );
-
+        this._report(err.message + "\n");
+        this._report(
+          "Provide an input file name and optionally an output file name"
+        );
         var status = SystemC.EXIT_BADARGS;
       } else if (err instanceof NoSuchFileError) {
         this._report(String(err));
@@ -128,6 +123,6 @@ SystemC.EXIT_BADTEXT = 10;
 
 SystemC.ArgError = class ArgError extends Error {
   constructor() {
-    super("wrong number of arguments");
+    super("Illegal number of arguments");
   }
 }
