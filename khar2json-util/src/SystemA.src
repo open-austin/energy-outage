@@ -1,0 +1,104 @@
+export
+class SystemA {
+  /**
+   * Should be called from within `main`.
+   *
+   * @param $$ApplicationConstructor: constructor<{ interface App }>
+   *        The constructor for the program.
+   * @return
+   *        Promise<{ interface App }>.  Use it within `main` to drive the
+   *        program.
+   */
+  setUpForExec($$ApplicationConstructor) {
+    throw new SystemA.UnimplementedError;
+  }
+
+  /**
+   * @return
+   *        Array<string> corresponding to the program arguments.
+   */
+  getProgramArguments() {
+    throw new SystemA.UnimplementedError;
+  }
+
+  /**
+   * Should be called when it's time to end the program.
+   *
+   * @param app: { interface App }
+   *        The application instance obtained from `setUpForExec` (or null if
+   *        not available).
+   * @param err: { interface Error }
+   *        Any error that ocurred, or null if it completed successfully.
+   */
+  finish(app, err) {
+    throw new SystemA.UnimplementedError;
+  }
+
+  /**
+   * Obtains the contents of the file at the given path.
+   *
+   * @param path: string
+   *        The path where the file lives.
+   * @return
+   *        Promise<Uint8Array> resolves to the bytes read
+   */
+  read(path) {
+    throw new SystemA.UnimplementedError;
+  }
+
+  /**
+   * Write to a file at the given path with the given contents.
+   *
+   * @param path: string
+   *        The path of the file to be written.
+   * @param contents: string
+   *        The text that should be written to the file.
+   * @return
+   *        Promise<void> resolves when the file has been written
+   */
+  write(path, contents) {
+    throw new SystemA.UnimplementedError;
+  }
+
+  /**
+   * A helper to get an instance that actually implements the system
+   * interface.
+   *
+   * @param $SystemKind: constructor<{ interface System }>
+   *        The constructor (`SystemB`, `SystemC`...) for a given backend.
+   * @return
+   *        { interface System } if the given class supports the current host
+   *        environment (and where such return value is an instance of the
+   *        given class), or null otherwise.
+   */
+  static create($SystemKind) {
+    try {
+      return new $SystemKind;
+    } catch (ex) {
+      if (ex instanceof SystemA.ShuntingError) {
+        return null;
+      }
+      throw ex;
+    }
+  }
+}
+
+SystemA.NoSuchFileError = class NoSuchFileError extends Error {
+  constructor(path, message = "No such file") {
+    super(message);
+    this.path = path;
+  }
+
+  toString() {
+    return this.message + ": " + this.path
+  }
+}
+
+SystemA.NoFileSourceError = class NoFileSourceError extends Error {
+  constructor() {
+    super("No file source");
+  }
+}
+
+SystemA.ShuntingError = class ShuntingError extends Error { };
+SystemA.UnimplementedError = class UnimplementedError extends Error { };

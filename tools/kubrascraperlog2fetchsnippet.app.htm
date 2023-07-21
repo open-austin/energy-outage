@@ -1,0 +1,923 @@
+//? <script>
+// This utility was forked from khar2json just after it was renamed from
+// "har2json" (commit 9b3a2f4583126b1fce53fd7863a599b284b2278a).  Viz:
+//
+//     $ nodejs ./khar2json-util/Build.app.htm ./khar2json-util/main.src
+//     $ mv ./out.app.htm ./tools/kubrascraperlog2fetchsnippet.app.htm
+//
+// The problem: in order to test that khar2json is working correctly, we need
+// good input in the form of a HAR that contains all relevant resources.
+// Trying to prepare a HAR manually is tricky since the outage map refreshes
+// periodically; if we run the original Python implementation and log all the
+// URLs requested and then separately open up the browser to initiate a series
+// of requests to the same URLs in order to get a HAR capture, then it's
+// possible that the contents at the other end of at least one of the requests
+// (a very important one) has changed in the meantime--especially since
+// manually working through the steps to obtain a HAR this way can take a lot
+// of time, even if there are only a few outages on the map at the time...
+//
+// The solution: after modifying the original Python implementation to log all
+// the URLs that it fetches, save that output to a file, and then run a
+// utility that consumes the log file and then writes a script that you can
+// use directly from your browser's developer tools (i.e. by pasting the
+// script into the console).  The generated script can thus perform a series
+// of fetches.  With this being automated, it will be far easier to create a
+// new capture at any given time (to use in e.g. tests) and to get it right
+// when doing so (i.e. far less error-prone).
+//
+// Since khar2json is a simple utility that already reads a file and outputs
+// another file, I just "remixed" it to be able to do _this_ job. --crussell
+//
+// The recommended way to use this:
+//
+//   1. Visit e.g. <https://kubra.io/product/5.35.0/static/js/main.js>
+//
+//   2. Open the Network inspector tab in your browser developer tools
+//
+//   3. In the devtools JS console, prime the input (i.e. fill it in, but
+//      don't press Enter yet) with something like:
+//
+//          document.body.innerHTML = (
+//            "<iframe src='https://kubra.io/product/5.35.0/manifest.json'/>"
+//          );
+//
+//   4. Run the modified Python scraper: `python3 ./scrape_all.py`
+//
+//   5. Save the output of step 4 (i.e. everything it prints out) as e.g.
+//      "logs.txt"
+//
+//   6. Run this tool (kubrascraperlog2fetchsnippet.app.htm) with the file
+//      from step 5 as the input
+//
+//   7. By default step 6 will save a file "fetch.js", so open that and copy
+//      the contents to your clipboard
+//
+//   8. Go back to the devtools console you left open in step 3 and press
+//      Enter
+//
+//   9. Paste the generated fetch snippet into the console and press Enter
+//
+//   10. Wait for the requests to finish
+//
+//   11. Using the developer tools, save the network capture as e.g.
+//       "kubra.har.json"
+//
+// Tips:
+//
+// - The URL in step 1 is not that important.  It just needs to be a fairly
+//   unremarkable (i.e. simple) page.  If it makes you feel better, you can
+//   check <view-source:https://outagemap.austinenergy.com> (alternatively: if
+//   the other one is a 404 when you try to visit) and then find the more
+//   recent equivalent.
+//
+// - The URL in step 3 isn't that important, either--it's just a simple sanity
+//   check--but it will actually show up in the HAR capture, so make sure it's
+//   something you think is appropriate, especially if you plan on publishing
+//   the HAR.  The manifest is a resonable choice.
+//
+// - When you first open the Network tab, make sure you have it set up to
+//   ignore the browser cache.
+//
+// - Make sure you complete steps 4 through 9 fairly quickly.  Aside from
+//   waiting for the original scraper to finish, it shouldn't take more than a
+//   few seconds.  If you take too much time, you're risking a race condition
+//   with the data in the outage map refreshing.  (In reality, this is a risk
+//   no matter how quickly you do it, but you shrink the window of opportunity
+//   if you're quick.)  This is obviously not well-suited for very large data
+//   sets.
+//
+// TODO: Check whether there's enough information present in the ordinary
+// output (some URLs do get printed, but not all) to allow us to reconstruct
+// the rest (so no modifications needed).
+
+/// export
+class LogMunger {
+  // NB: This is a void method; main.src depends on it having no return value.
+  async run(inputPath, defaultName = "fetch.js") {
+    try {
+      var contents = await this._system.read(inputPath);
+      var urls = this._getURLs(contents);
+      var scriptText = this._generateScriptForURLs(urls);
+    } catch (ex) {
+      throw (this.print("Failed to munge..."), ex);
+    }
+
+    if (!this.outputPath) {
+      this._outputPath = defaultName;
+    }
+
+    await this._system.write(this._outputPath, scriptText);
+
+    return void(0);
+  }
+
+  // XXX Assumes a modified `_make_request` that prints the URL, as described.
+  _getURLs(input) {
+    // Please don't "optimize" this constant definition.  Having it formatted
+    // this way makes my life somewhat easier. --crussell
+    const PREFIX = ">>" + ">" + ">>url ";
+    return input.split("\n").
+      filter((x) => (x.startsWith(PREFIX))).
+      map((x) => (x.substr(PREFIX.length).trim()));
+  }
+
+  _generateScriptForURLs(urls) {
+    // The whitespace/padding is not strictly important, but kind of nice...
+    let QUOTED_URL_LIST = urls.
+      map((x) => (JSON.stringify(x))).
+      join(",\n          ");
+
+    // This will cause a "Malformed template content" error during build/
+    // decompilation with trplkt v0.12.0.  The workaround: delete the line,
+    // run trplkt, and then put it back in.
+    return (`
+      let f = function* () {
+        let urls = [
+          ${ QUOTED_URL_LIST }
+        ];
+
+        for (let i = 0, n = urls.length; i < n; ++i) {
+          yield void(fetch(urls[i]));
+        }
+      }
+
+      let g = f();
+
+      var id = setInterval(
+        (() => { if (g.next().done) clearInterval(id) }), 1357
+      )
+    `);
+  }
+
+  print(...args) {
+    if (typeof(console) != "undefined") {
+      console.log(...args);
+    } else { // this should be unreachable, but just for good measure...
+      throw new Error("Couldn't print feedback message!");
+    }
+  }
+
+  setOutputFile(path) {
+    this._outputPath = path;
+  }
+
+  constructor(system) {
+    this._system = system;
+    this._outputPath = null;
+  }
+}
+//? </script>
+//? <script>
+/// export
+class SystemA {
+  /**
+   * Should be called from within `main`.
+   *
+   * @param $$ApplicationConstructor: constructor<{ interface App }>
+   *        The constructor for the program.
+   * @return
+   *        Promise<{ interface App }>.  Use it within `main` to drive the
+   *        program.
+   */
+  setUpForExec($$ApplicationConstructor) {
+    throw new SystemA.UnimplementedError;
+  }
+
+  /**
+   * @return
+   *        Array<string> corresponding to the program arguments.
+   */
+  getProgramArguments() {
+    throw new SystemA.UnimplementedError;
+  }
+
+  /**
+   * Should be called when it's time to end the program.
+   *
+   * @param app: { interface App }
+   *        The application instance obtained from `setUpForExec` (or null if
+   *        not available).
+   * @param err: { interface Error }
+   *        Any error that ocurred, or null if it completed successfully.
+   */
+  finish(app, err) {
+    throw new SystemA.UnimplementedError;
+  }
+
+  /**
+   * Obtains the contents of the file at the given path.
+   *
+   * @param path: string
+   *        The path where the file lives.
+   * @return
+   *        Promise<Uint8Array> resolves to the bytes read
+   */
+  read(path) {
+    throw new SystemA.UnimplementedError;
+  }
+
+  /**
+   * Write to a file at the given path with the given contents.
+   *
+   * @param path: string
+   *        The path of the file to be written.
+   * @param contents: string
+   *        The text that should be written to the file.
+   * @return
+   *        Promise<void> resolves when the file has been written
+   */
+  write(path, contents) {
+    throw new SystemA.UnimplementedError;
+  }
+
+  /**
+   * A helper to get an instance that actually implements the system
+   * interface.
+   *
+   * @param $SystemKind: constructor<{ interface System }>
+   *        The constructor (`SystemB`, `SystemC`...) for a given backend.
+   * @return
+   *        { interface System } if the given class supports the current host
+   *        environment (and where such return value is an instance of the
+   *        given class), or null otherwise.
+   */
+  static create($SystemKind) {
+    try {
+      return new $SystemKind;
+    } catch (ex) {
+      if (ex instanceof SystemA.ShuntingError) {
+        return null;
+      }
+      throw ex;
+    }
+  }
+}
+
+SystemA.NoSuchFileError = class NoSuchFileError extends Error {
+  constructor(path, message = "No such file") {
+    super(message);
+    this.path = path;
+  }
+}
+
+SystemA.NoFileSourceError = class NoFileSourceError extends Error {
+  constructor() {
+    super("No file source");
+  }
+}
+
+SystemA.ShuntingError = class ShuntingError extends Error { };
+SystemA.UnimplementedError = class UnimplementedError extends Error { };
+//? </script>
+//? <script>
+/// import { BrowserUI } from "./BrowserUI.src";
+/// import { FileCache } from "./FileCache.src";
+/// import { FileUtils } from "./FileUtils.src";
+/// import { SystemA } from "./SystemA.src";
+/// import { WebkitFileIngester } from "./WebkitFileIngester.src";
+/// import { credits } from "./credits.src";
+
+/// export
+class SystemB extends SystemA {
+  constructor() {
+    super();
+
+    if (typeof(window) == "undefined") {
+      throw new SystemA.ShuntingError("Not a browser environment");
+    }
+
+    this._document = window.document;
+
+    this._arg = null;
+    this._directoryInput = null;
+    this._fileSource = null;
+    this._fileName = null;
+    this._ui = null;
+
+    this._artifacts = new FileCache();
+  }
+
+  setUpForExec($$util) {
+    return new Promise((resolve) => {
+      this._document.defaultView.onload = (() => {
+        this._ui = new BrowserUI(this, this._document);
+
+        /*
+        this.output = new ConsoleOutput({
+          printLine: ((text) => void(this._ui.printFeedback(text)))
+        });
+        */
+
+        let $$ = this._document.createElement.bind(this._document);
+
+        let fileInput = $$("input");
+        fileInput.setAttribute("type", "file");
+        fileInput.style.display = "none";
+        this._directoryInput = this._document.head.appendChild(fileInput);
+
+        let app = new $$util(this);
+        this._directoryInput.onchange = this._onDirectoryChange.bind(
+          this, resolve, app
+        );
+        // TODO for good measure (incl. debugging purposes), we should
+        // probably make the app instance globally accessible via UUID.
+      });
+    });
+  }
+
+  read(path) {
+    const { NoSuchFileError } = SystemA;
+    const { NoFileSourceError } = SystemA;
+    if (this._fileSource) {
+      let file = this._fileSource.recall(path);
+      return WebkitFileIngester.readBlob(file).then((contents) => {
+        if (contents === null) {
+          return Promise.reject(new NoSuchFileError(path));
+        }
+        return Promise.resolve(contents);
+      });
+    }
+    return Promise.reject(new NoFileSourceError);
+  }
+
+  write(path, contents) {
+    if (path) {
+      if (!this._fileName) {
+        this._artifacts.store(new Blob([ contents ]), path);
+        this._fileName = path;
+        return Promise.resolve();
+      }
+      return Promise.reject(new Error("Can't write multiple files"));
+    }
+    return Promise.reject(new Error("Empty file name"));
+  }
+
+  list(path) {
+    return Promise.resolve(
+      FileUtils.list(this._fileSource, path)
+    );
+  }
+
+  // NB: internal use only (for UI; not part of the abstract system interface)
+  requestFileSource() {
+    this._directoryInput.click();
+  }
+
+  _onDirectoryChange($unblock, app, event) {
+    let [ file ] = event.target.files;
+
+    this._arg = file.name;
+
+    this._fileSource = new FileCache();
+    // XXX WebkitFileIngester.cache([ file ], this._fileSource); // XXX
+    this._fileSource.store(file, file.name);
+
+    this._ui.acknowledgeFileSource();
+    $unblock(app);
+  }
+
+  finish(app, err = null) {
+    if (err) {
+      throw err; // XXX
+    } else if (!this._fileName) {
+      throw Error("no file written"); // XXX
+    }
+
+    this._export(this._fileName);
+  }
+
+  getProgramArguments() {
+    return [ this._arg ];
+  }
+
+  _export(fileName) {
+    this._saveFile(fileName, this._artifacts.recall(fileName));
+  }
+
+  _saveFile(name, blob) {
+    let anchor = this._document.createElement("a");
+    anchor.href = URL.createObjectURL(blob);
+    anchor.download = name;
+    this._document.head.appendChild(anchor).click();
+    anchor.parentNode.removeChild(anchor);
+  }
+}
+//? </script>
+//? <script>
+/// import { ConsoleAppStyle } from "./ConsoleAppStyle.src";
+
+/// export
+class BrowserUI {
+  constructor(capos, document) {
+    this._capos = capos;
+    this._document = document;
+
+    /*
+    this._vtty = new ConsoleBuffer();
+    let writer = new LineWriter(this._vtty);
+    this.input = new LineReader(this._vtty, writer);
+    this.output = new ConsoleOutput(writer);
+
+    this._tabBox = null;
+    this.console = null;
+    */
+
+    this._injectUI();
+  }
+
+  _injectUI() {
+    let container = this._fixQuirks();
+    ConsoleAppStyle.applySkin(this._document.body.parentNode);
+
+    let $$ = this._document.createElement.bind(this._document);
+
+    let loadArea = container.appendChild($$("div"));
+    loadArea.className = "load-area";
+
+    let loadButton = $$("label");
+    loadButton.className = "empty file-source-chooser";
+    loadButton.textContent = "Open\u2026";
+    loadButton.style.fontFamily = "sans";
+    this._loadButton = loadArea.appendChild(loadButton);
+
+    /*
+    this._tabBox = new TabBox(container);
+    let consolePanel = this._tabBox.addTab("Console");
+
+    consolePanel.classList.add("console-panel");
+    this.console = new ConsoleWidget(consolePanel, this._vtty, this.input);
+    this.console.focus();
+
+    this._tabBox.ontabswitch = ((panel) => {
+      if (panel == consolePanel) this.console.focus();
+    });
+    */
+
+    this._loadButton.onclick = (() => void(this._capos.requestFileSource()));
+  }
+
+  _fixQuirks(title = "") {
+    this._document.open();
+    this._document.write(
+      "<!DOCTYPE html><html><head><meta charset='utf-8'><title>" + title
+    );
+    this._document.close();
+    return this._document.body;
+  }
+
+  acknowledgeFileSource() {
+    this._loadButton.classList.remove("empty");
+  }
+}
+//? </script>
+//? <script>
+/// export
+class ConsoleAppStyle {
+  static applySkin(parent) {
+    let styleElement = parent.ownerDocument.createElement("style");
+    parent.appendChild(styleElement);
+
+    let $ = styleElement.sheet.insertRule.bind(styleElement.sheet);
+    $("body {" +
+        "margin: 0.5em;" +
+        "background-color: #f0f5f8;" +
+    "}");
+
+    $(".tab-strip label.selected {" +
+        "border-top: 4px solid #58b;" +
+        "background-color: #FFF;" +
+    "}");
+
+    $(".load-area {" +
+        "float: right;" +
+        "margin: 0.5em 0;" +
+    "}");
+
+    $(".file-source-chooser {" +
+        "padding: 0.5em 1em 0.5em 1em;" +
+        "border: 1px solid #c5c8cb;" +
+        "border-radius: 4px;" +
+    "}");
+
+    $(".file-source-chooser.empty, .file-source-chooser:hover {" +
+        "background-color: #fff;" +
+    "}");
+
+    $(".term-content {" +
+        "color: #f5f8fb;" +
+        "background-color: #15181b;" +
+    "}");
+
+    $(".term-clipboard {" +
+        "color: #f5f8fb;" +
+        "background-color: #15181b;" +
+        "border: 4px solid #58b;" +
+        "border-radius: 2px;" +
+        "padding: 0.5em;" +
+    "}");
+
+    $(".term-clipboard::selection {" +
+        "background-color: #58b;" +
+    "}");
+
+    $(".console-panel {" +
+        "background-color: #15181b;" +
+        "height: calc(100vh - 4.25em);" +
+        "padding: 0.25em" +
+    "}");
+  }
+}
+//? </script>
+//? <script>
+/// export
+class FileCache {
+  constructor() {
+    this._blobs = new Map();
+  }
+
+  static normalizePath(path) {
+    if (path.startsWith("/")) return path.substr(("/").length);
+    if (path.startsWith("./")) return path.substr(("./").length);
+    return path;
+  }
+
+  store(blob, path) {
+    path = FileCache.normalizePath(path);
+    this._blobs.set(path, blob);
+  }
+
+  recall(path) {
+    path = FileCache.normalizePath(path);
+    return this._blobs.get(path);
+  }
+
+  list() {
+    return Array.from(this._blobs.keys());
+  }
+}
+//? </script>
+//? <script>
+/// import { FileCache } from "./FileCache.src";
+
+/// export
+class FileUtils {
+  static list(cache, path) {
+    path = FileCache.normalizePath(path);
+    if (path && !path.endsWith("/")) path += "/";
+
+    let kids = new Set();
+    let all = cache.list();
+    for (let i = 0, n = all.length; i < n; ++i) {
+      if (!all[i].startsWith(path)) continue;
+      let relative = all[i].substr(path.length);
+      let idx = relative.indexOf("/");
+      if (idx < 0) { // file
+        var name = relative;
+      } else { // subdirectory
+        var name = relative.substr(0, idx + 1);
+        // assert(name.endsWith("/"))
+      }
+      if (!kids.has(name)) {
+        kids.add(name);
+      }
+    }
+
+    return Array.from(kids.values()).sort();
+  }
+}
+//? </script>
+//? <script>
+/// import { FileCache } from "./FileCache.src";
+
+/// export
+class WebkitFileIngester {
+  static cache(fileList, cache = new FileCache()) {
+    if (!fileList.length) return null;
+
+    let $prefixOf = ((path) => path.substr(0, path.indexOf("/", 1)));
+    let prefix = $prefixOf(fileList[0].webkitRelativePath);
+    for (let i = 0; i < fileList.length; ++i) {
+      // assert($prefixOf(fileList[i].webkitRelativePath) == prefix)
+      let path = fileList[i].webkitRelativePath.substr(prefix.length);
+      cache.store(fileList[i], path);
+    }
+
+    return cache;
+  }
+
+  static readBlob(blob, raw = false) {
+    if (!blob) return Promise.resolve(null);
+    if (typeof(FileReader) != "undefined") {
+      let reader = new FileReader();
+      return new Promise(function(resolve) {
+        reader.addEventListener("loadend", resolve);
+        if (raw) {
+          reader.readAsArrayBuffer(blob);
+        } else {
+          reader.readAsText(blob);
+        }
+      }).then(function(event) {
+        return event.target.result;
+      });
+    }
+    throw new Error("FileReader API not implemented");
+  }
+}
+//? </script>
+//? <script>
+/// export ...
+var credits =
+` ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' '
+kubrascraperlog2fetchsnippet
+
+NB: Any auxiliary development tools, including but not limited to those
+distributed alongside the project source code and used to build the primary
+work, are separate works used under license compatible with this use and are
+not considered a part of the primary work.
+
+The primary work also incorporates elements from other works, some of which
+are available under free and open source licenses.
+
+The license for the primary work is unspecified.
+
+(The preceding notes are informational, and reproducing them is not itself
+intended to be a prerequisite for redistribution, although the inclusion of
+some of the content below may be required in order to redistribute the primary
+work in whole or in part.)
+
+Authorship and contributions
+============================
+
+* Colby Russell
+
+Licenses compatible for use in the primary work
+===============================================
+
+MIT License
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' ' `
+//? </script>
+//? <script>
+/// import { FileNodeFSAdapter } from "./FileNodeFSAdapter.src";
+/// import { SystemA } from "./SystemA.src";
+/// import { credits } from "./credits.src";
+
+/// export
+class SystemC extends SystemA {
+  constructor() {
+    super();
+
+    if (typeof(console) == "undefined" ||
+        typeof(process) == "undefined" ||
+        typeof(module) == "undefined") {
+      throw new SystemA.ShuntingError("Not a NodeJS environment");
+    }
+
+    if (process.argv.indexOf("--version") >= 0) {
+      console.log(credits);
+      process.exit(SystemC.EXIT_SUCCESS);
+    }
+
+    const fs = module.require("fs");
+    const path = module.require("path");
+
+    this._process = process;
+
+    let [ engine, script, ...eargs ] = process.argv;
+    this._engine = engine;
+    this._script = script;
+    this._args = eargs;
+
+    /*
+    this.output = new ConsoleOutput({
+      printLine: ((text) => (void(console.log(text))))
+    });
+    */
+
+    this._files = new FileNodeFSAdapter(fs, path);
+
+    this._report = ((...what) => (void(console.error(...what))));
+  }
+
+  setUpForExec($$constructor) {
+    if (this._args.length) {
+      let app = new $$constructor(this);
+      return Promise.resolve(app);
+    }
+    return Promise.reject(new SystemC.ArgError);
+  }
+
+  finish(app, err = null) {
+    if (err) {
+      const { NoSuchFileError } = SystemA;
+      if (err instanceof SystemC.ArgError) {
+        this._report(err.message);
+
+        // If we were supporting interactive commands, here we could also do:
+        //
+        //   this._report(
+        //     "Usage: " + engine + " " + script + " <command> FILE" + "\n" +
+        //     "Available commands:" + "\n\n" + commandList
+        //   );
+
+        var status = SystemC.EXIT_BADARGS;
+      } else if (err instanceof NoSuchFileError) {
+        this._report(err.message);
+        var status = SystemC.EXIT_BADFILE;
+      } else {
+        this._report("Unrecognized error:", err);
+        var status = SystemC.EXIT_EXECERR;
+      }
+
+      if (status == undefined) {
+        this._report("Unhandled error:", err);
+        status = SystemC.EXIT_EXECERR;
+      }
+
+      return void(this._process.exit(status));
+    }
+
+    this._process.exit(SystemC.EXIT_SUCCESS);
+  }
+
+  getProgramArguments() {
+    const { ArgError } = SystemC;
+
+    if (this._args.length == 1) { // XXX
+      return this._args;
+    }
+
+    throw new ArgError();
+  }
+
+  read(path) {
+    return this._files.read(path).catch((err) => {
+      return this._wrapFSError(err, path);
+    });
+  }
+
+  write(path, contents) {
+    return this._files.write(path, contents).catch((err) => {
+      return this._wrapFSError(err, path);
+    });
+  }
+
+  list(path) {
+    return this._files.list(path).catch((err) => {
+      return this._wrapFSError(err, path);
+    });
+  }
+
+  _wrapFSError(nodeError, path) {
+    const { NoSuchFileError } = SystemA;
+    switch (nodeError.code) {
+      case "ENOENT":
+        return Promise.reject(new NoSuchFileError(path));
+      break;
+    }
+    return Promise.reject(nodeError);
+  }
+}
+
+SystemC.EXIT_EXECERR = -1;
+SystemC.EXIT_SUCCESS = 0;
+SystemC.EXIT_BADARGS = 1;
+SystemC.EXIT_BADFILE = 2;
+
+SystemC.EXIT_BADTEXT = 10;
+
+SystemC.ArgError = class ArgError extends Error {
+  constructor() {
+    super("wrong number of arguments");
+  }
+}
+//? </script>
+//? <script>
+/// export
+class FileNodeFSAdapter {
+  constructor(fs, path, workDir = ".") {
+    this._nodeFS = fs;
+    this._nodePath = path;
+    this._workDir = workDir;
+  }
+
+  read(path, raw = false) {
+    path = this._nodePath.join(this._workDir, path);
+    if (!raw) {
+      var options = { encoding: "utf8" };
+    }
+    return new Promise((resolve, reject) => {
+      void this._nodeFS.readFile(path, options, ((err, contents) => {
+        if (err) {
+          reject(err);
+        } else if (raw) {
+          resolve(Uint8Array.from(contents))
+        } else {
+          resolve(contents)
+        }
+      }));
+    });
+  }
+
+  write(path, contents) {
+    path = this._nodePath.join(this._workDir, path);
+    let parent = path.substr(0, path.lastIndexOf("/"));
+    return new Promise((resolve, reject) => {
+      try {
+        if (parent) this._forceDirectory(parent);
+      } catch (ex) {
+        return void(reject(ex));
+      }
+      this._nodeFS.writeFile(path, contents, ((err) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve();
+        }
+      }));
+    });
+  }
+
+  list(path) {
+    path = this._nodePath.join(this._workDir, path);
+    return new Promise((resolve) => {
+      this._nodeFS.readdir(path, ((err, fileNames) => {
+        if (err) return void(resolve(null));
+        resolve(fileNames.map((name) => {
+          let stats = this._nodeFS.statSync(path + name);
+          if (stats.isDirectory()) return name + "/";
+          return name;
+        }).sort());
+      }));
+    });
+  }
+
+  _forceDirectory(path) {
+    let stats = this._stat(path);
+    if (stats) {
+      if (stats.isDirectory()) return;
+      throw new Error("not a directory");
+    }
+    let parent = path.substr(0, path.lastIndexOf("/"));
+    if (parent) this._forceDirectory(parent);
+    this._nodeFS.mkdirSync(path);
+  }
+
+  _stat(path) {
+    try {
+      return this._nodeFS.statSync(path);
+    } catch (ex) {
+      return null;
+    }
+  }
+}
+//? </script>
+//? <script>
+/// import { LogMunger } from "./src/LogMunger.src";
+
+/// import { SystemA } from "./src/SystemA.src";
+/// import { SystemB } from "./src/SystemB.src";
+/// import { SystemC } from "./src/SystemC.src";
+
+void function main() {
+  if (!system) var system = SystemA.create(SystemB);
+  if (!system) var system = SystemA.create(SystemC);
+  if (!system) throw SystemA.ShuntingError("Unknown environment");
+
+  system.setUpForExec(LogMunger).then((munger) => {
+    let [ inputPath, ...opt ] = system.getProgramArguments();
+    let outputPath = (opt.length && opt[0]) || null;
+    if (outputPath) {
+      munger.setOutputFile(outputPath);
+    }
+
+    let nu = munger.run(inputPath);
+
+    nu.then($finish);
+    nu.catch($finish);
+
+    function $finish(err = null) {
+      system.finish(munger, err);
+    }
+  });
+} ();
+
+/// $path$: "kubrascraperlog2fetchsnippet/main.src"
+//? </script>

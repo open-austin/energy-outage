@@ -1,0 +1,156 @@
+// khar2json is a utility that converts a HAR network capture into the format
+// output by the Kubra scraper <https://github.com/codeforkyana/kubra-scraper>
+// by Code for Kentuckiana.
+//
+// The general strategy here is that the scraper need not be concerned with
+// scraping per se; it merely reads in the input files and writes out the data
+// after transforming it--it is entirely agnostic as to whether the content
+// it's trying to read is coming in live over the network versus from the
+// local file system versus a simulacrum that presents a network- or file-like
+// abstraction but works in some unknown-to-the-scraper way.  That's where
+// khar2json comes in.
+//
+// When khar2json is built and the scraper is linked in, class `KHAR2JSONUtil`
+// provides a way to perform simulated read operations that successfully
+// complete (or not) based on the contents of a HAR capture.  This is not
+// unlike the `HARMockServer`-based testing strategy; refer to the `tests/`
+// directory.
+//
+// (An actual scraper, however, is generally intended to make real network
+// requests to harvest the relevant data, of course.  The khar2json utility in
+// that case is not especially helpful, but the abstraction that allows the
+// heart of the scraper to be agnostic to whether it's running as part of a
+// conversion utility or not also allows the scraper to be hoisted into a
+// service that takes advantage of the same abstraction to allow the scraper
+// to work with live data coming over the wire via real network requests.)
+
+import { CoordinatePrecisionHack } from "../../CoordinatePrecisionHack.src";
+
+export
+class KHAR2JSONUtil {
+  constructor(system, asyncReadFileHelper = null) {
+    this._system = system;
+    if (!this.$actuallyReadFileContents) {
+      this.$actuallyReadFileContents = this._system.read.bind(this._system);
+    }
+
+    this._cache = new Map();
+    this._items = null;
+    this._scraper = null;
+    this._outputPath = null;
+
+    this._onReadyForReads = null;
+    this._archiveCaptureReadiness = new Promise(($unblock) => {
+      this._onReadyForReads = $unblock;
+    });
+  }
+
+  // XXX The control flow/handling around this is pretty derpy...
+  setOutputFile(path) {
+    this._outputPath = path;
+  }
+
+  delegateTo($$OutageDataAgent) {
+    this._scraper = new $$OutageDataAgent(this);
+  }
+
+  // NB: This is a void method; main.src depends on it having no return value.
+  async run(inputPath, defaultName = "output.json", scraper = this._scraper) {
+    const { $actuallyReadFileContents } = this;
+
+    let contents = await $actuallyReadFileContents(inputPath);
+    try {
+      this._items = JSON.parse(contents)["log"]["entries"];
+    } catch (ex) {
+      throw (this.log("The input file isn't valid JSON!"), ex); // XXX
+    }
+
+    // This unblocks the scraper so it can finish initialization.
+    this._onReadyForReads();
+
+    let listOfOutages = await scraper.fetchData();
+
+    if (!this._outputPath) {
+      this._outputPath = defaultName;
+    }
+
+    return await this._system.write(
+      this._outputPath, this._prettyPrint(listOfOutages)
+    );
+  }
+
+  // This is meant to control how the JSON is actually written.  Necessary
+  // because TC-39's `JSON.stringify` specification is deficient for dealing
+  // with floating point numbers (specifically on the matter of truncation).
+  _prettyPrint(data) {
+    return CoordinatePrecisionHack.formatJSON(data);
+  }
+
+  // By implementing this method, we conform to the interface expected by the
+  // scraper impl of its `read`-able data source.  See `delegateTo`.
+  async read(name) {
+    await this._archiveCaptureReadiness;
+
+    // To underscore the significance of the abstraction in use here, we
+    // delegate to an internal method with a more explicit name.
+    return this._requestSimulatedFileOrGetFromCache(name);
+  }
+
+  async _requestSimulatedFileOrGetFromCache(name) {
+    const { ReadResult } = KHAR2JSONUtil;
+
+    let hits = this._items.filter((x) => {
+      return x.request.url == name && x.request.method == "GET"
+    });
+    if (hits.length) {
+      let [ winner ] = hits; // i.e., first one wins XXX should it?
+      let result = new ReadResult(
+        winner.response.content.text, winner.response.status
+      );
+      this._cache.set(name, result);
+      return result;
+    }
+
+    return new ReadResult(null);
+  }
+
+  log(...args) {
+    if (typeof(console) != "undefined") {
+      console.log(...args);
+    } else { // this should be unreachable, but just for good measure...
+      throw new Error("Couldn't print feedback message!");
+    }
+  }
+}
+
+// XXX This is not the best interface, but (at least for the time being) we're
+// trying to stick as closely as possible to the way the original scraper was
+// implemented, and that means matching a subset of the Python requests API.
+KHAR2JSONUtil.ReadResult = class ReadResult {
+  static from(other) {
+    return new Result(other.selection, other.status);
+  }
+
+  constructor(selection, status = null) {
+    if (status == null) {
+      if (selection == null) {
+        status = 404;
+      } else {
+        status = 200;
+      }
+    }
+    this.status = status;
+    this.selection = selection;
+  }
+
+  get ok() {
+    return this.status == 200;
+  }
+
+  asJSON() { // XXX needs audit/scrutiny
+    if (this.ok && this.selection) {
+      return JSON.parse(this.selection);
+    }
+    throw Error("response not valid JSON");
+  }
+}

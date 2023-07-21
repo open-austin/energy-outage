@@ -1,0 +1,99 @@
+/*
+ * Consider the following polyline encoding: "}o}wDzvasQ".  This decodes to
+ * the coordinate pair [ 30.302870000000002, -97.6627 ].  This can be verified
+ * with the Interactive Polyline Encoder Utility by Google available online:
+ * <https://developers.google.com/maps/documentation/utilities/polylineutility>
+ * (This requires placing a breakpoint in the browser's JS debugger in order
+ * to see the result that Google's decoding lib produces--before it gets
+ * formatted for the screen.)
+ *
+ * It has been observed that in the original Python implementation, this
+ * region encoding is actually associated with the JSON output:
+ *
+ *    [ ...
+ *     { ...
+ *       "latitude": 30.30287,
+ *       "longitude": -97.6627,
+ *     ... }
+ *   ... ]
+ *
+ * The polyline decoding lib that the Python implementation depends on uses a
+ * precision of 5.  If we were to naively rely on `JSON.stringify` to output
+ * the results of our polyline decoding, which is faithful to Google's
+ * reference implementation, we'd end up getting coordinates with a latitude
+ * that includes the entire fractional component, i.e., 30.302870000000002.
+ * In Google's utility, they rely on `Number.prototype.toFixed` with an
+ * argument of 5 to format the coordinates for display.  We, however, cannot
+ * rely on this, because if the results should produce something like the
+ * -97.6627 value for the longitude shown here, then we'll end up with a
+ * representation written as -97.66270 instead, and we are, at least for the
+ * time being, aiming for exact parity with the output of the original Python
+ * implementation.
+ *
+ * (There's also the not-so-small issue that `Number.prototype.toFixed`
+ * produces a string, not a number, and `JSON.stringify` is ill-equipped to
+ * let you return a string specifying the exact form of output that you desire
+ * without that value itself getting "stringified"--i.e. being encoded as a
+ * JSON string itself...)
+ *
+ * Enter the `CoordinatePrecisionHack`.  It provides a method `formatJSON`
+ * which will (as far as it has been tested) work to produce exactly the form
+ * that we need to satisfy our goal of maintaining output parity with the
+ * original Python implementation.
+ *
+ * Q: When will it be safe to delete this hack?  A: If it is decided that it is
+ * no longer important to produce identical output to what the Python
+ * implementation would have produced.
+ *
+ * Q: How do we excise this hack from the codebase if/when we decide to get
+ * rid of it?  A: Find the calls to `CoordinatePrecisionHack.formatJSON` and
+ * replace them with direct use of `JSON.stringify` (or whatever alternative
+ * is decided upon), then delete this module.
+ *
+ * Note that this implementation does assume that the serialized form of the
+ * JSON object it's given does not contain any subsequence that would collide
+ * with URIs of the form <tag:open-austin.org,2023:xlatlong>.  This shouldn't
+ * be difficult, since I just made it up--so before yesterday, this is
+ * probably the first time this character sequence has appeared anywhere,
+ * ever.  In the event it does, though, we fail hard by throwing an error.
+ *
+ * See <http://taguri.org/> and <https://en.wikipedia.org/wiki/Tag_URI_scheme>
+ */
+
+export
+class CoordinatePrecisionHack {
+  // Slow?  Probably.  Ugly?  Yes.  Works?  Also yes.
+  static formatJSON(listOfOutages) {
+    let adulterated = JSON.stringify(listOfOutages, $replacer, "    ");
+
+    function $replacer(key, value) {
+      const DISTINGUISHER = "tag:open-austin.org,2023:xlatlong#";
+      if ((typeof(value) != "string" || !value.includes(DISTINGUISHER)) &&
+          !key.includes(DISTINGUISHER)) {
+        if (key == "latitude" || key == "longitude") {
+          return DISTINGUISHER + value.toFixed(5);
+        }
+        return value;
+      }
+      throw Error("Encountered private distinguisher somehow");
+    }
+
+    function $dereplacer(what) {
+      let padded = what.substring(
+        (what.indexOf("#") + ("#").length), (what.length - ("\"").length)
+      );
+      let digitsEtc = padded.split("");
+      while (digitsEtc.length > 1 && digitsEtc[digitsEtc.length - 1] == "0") {
+        digitsEtc.pop();
+        if (digitsEtc[digitsEtc.length - 1] == ".") {
+          digitsEtc.push("0");
+          break;
+        }
+      }
+      return digitsEtc.join("");
+    }
+
+    let pattern = (/"tag:open-austin.org,2023:xlatlong#[^"]+"/g);
+    return adulterated.replace(pattern, $dereplacer);
+  }
+}

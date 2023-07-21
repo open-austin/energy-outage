@@ -30,7 +30,7 @@ class Mapping {
   }
 
   static tiles(west, south, east, north, zooms) {
-    // XXX See `BoundingBoxHackMappingUtility`.
+    // XXX See `BoundingBoxTilingHack`.
     throw Error("unimplemented Mapping.tiles");
   }
 

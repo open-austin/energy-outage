@@ -1,0 +1,29 @@
+import { KHAR2JSONUtil } from "./src/KHAR2JSONUtil.src";
+
+import { SystemA } from "./src/SystemA.src";
+import { SystemB } from "./src/SystemB.src";
+import { SystemC } from "./src/SystemC.src";
+
+void function main() {
+  if (!system) var system = SystemA.create(SystemB);
+  if (!system) var system = SystemA.create(SystemC);
+  if (!system) throw SystemA.ShuntingError("Unknown environment");
+
+  system.setUpForExec(KHAR2JSONUtil).then((converter) => {
+    converter.delegateTo(AustinEnergyScraper);
+
+    let [ inputPath, ...opt ] = system.getProgramArguments();
+    let outputPath = (opt.length && opt[0]) || null;
+    if (outputPath) {
+      converter.setOutputFile(outputPath);
+    }
+
+    return converter.run(inputPath).then($finish);
+  }).catch($finish);
+
+  function $finish(err = null) {
+    system.finish(err);
+  }
+} ();
+
+import { AustinEnergyScraper } from "../AustinEnergyScraper.src";

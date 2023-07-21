@@ -1,0 +1,28 @@
+import { FileCache } from "./FileCache.src";
+
+export
+class FileUtils {
+  static list(cache, path) {
+    path = FileCache.normalizePath(path);
+    if (path && !path.endsWith("/")) path += "/";
+
+    let kids = new Set();
+    let all = cache.list();
+    for (let i = 0, n = all.length; i < n; ++i) {
+      if (!all[i].startsWith(path)) continue;
+      let relative = all[i].substr(path.length);
+      let idx = relative.indexOf("/");
+      if (idx < 0) { // file
+        var name = relative;
+      } else { // subdirectory
+        var name = relative.substr(0, idx + 1);
+        // assert(name.endsWith("/"))
+      }
+      if (!kids.has(name)) {
+        kids.add(name);
+      }
+    }
+
+    return Array.from(kids.values()).sort();
+  }
+}

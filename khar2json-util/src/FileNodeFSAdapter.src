@@ -1,0 +1,78 @@
+export
+class FileNodeFSAdapter {
+  constructor(fs, path, workDir = ".") {
+    this._nodeFS = fs;
+    this._nodePath = path;
+    this._workDir = workDir;
+  }
+
+  read(path, raw = false) {
+    path = this._nodePath.join(this._workDir, path);
+    if (!raw) {
+      var options = { encoding: "utf8" };
+    }
+    return new Promise((resolve, reject) => {
+      void this._nodeFS.readFile(path, options, ((err, contents) => {
+        if (err) {
+          reject(err);
+        } else if (raw) {
+          resolve(Uint8Array.from(contents))
+        } else {
+          resolve(contents)
+        }
+      }));
+    });
+  }
+
+  write(path, contents) {
+    path = this._nodePath.join(this._workDir, path);
+    let parent = path.substr(0, path.lastIndexOf("/"));
+    return new Promise((resolve, reject) => {
+      try {
+        if (parent) this._forceDirectory(parent);
+      } catch (ex) {
+        return void(reject(ex));
+      }
+      this._nodeFS.writeFile(path, contents, ((err) => {
+        if (err) {
+          reject(err);
+        } else {
+          resolve();
+        }
+      }));
+    });
+  }
+
+  list(path) {
+    path = this._nodePath.join(this._workDir, path);
+    return new Promise((resolve) => {
+      this._nodeFS.readdir(path, ((err, fileNames) => {
+        if (err) return void(resolve(null));
+        resolve(fileNames.map((name) => {
+          let stats = this._nodeFS.statSync(path + name);
+          if (stats.isDirectory()) return name + "/";
+          return name;
+        }).sort());
+      }));
+    });
+  }
+
+  _forceDirectory(path) {
+    let stats = this._stat(path);
+    if (stats) {
+      if (stats.isDirectory()) return;
+      throw new Error("not a directory");
+    }
+    let parent = path.substr(0, path.lastIndexOf("/"));
+    if (parent) this._forceDirectory(parent);
+    this._nodeFS.mkdirSync(path);
+  }
+
+  _stat(path) {
+    try {
+      return this._nodeFS.statSync(path);
+    } catch (ex) {
+      return null;
+    }
+  }
+}

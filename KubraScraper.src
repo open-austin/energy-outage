@@ -110,11 +110,11 @@ class KubraScraper extends DeltaScraper {
     */
 
     this.print(
-      (`Made ${this.totalRequests} requests,`),
-      (`fetching ${this.totalDownloaded / 1000} KB.`)
+      "Made " + String(this.totalRequests) + " requests, " +
+      "fetching " + String(this.totalDownloaded / 1000) + " KB."
     );
 
-    return Array.from(outages);
+    return Array.from(outages.values());
   }
 
   // NB: This goes by the unfortunate name `_fetch_data` in the original.
@@ -146,7 +146,7 @@ class KubraScraper extends DeltaScraper {
       for (let j = 0, n = json["file_data"].length; j < n; ++j) {
         let o = json["file_data"][j];
         this.print(o);
-        if ("cluster" in o["desc"]) {
+        if (o["desc"]["cluster"]) {
           let nextZoom = zoom + 1;
           if (nextZoom > KubraScraper.MAX_ZOOM) {
             this.print(
@@ -158,18 +158,18 @@ class KubraScraper extends DeltaScraper {
           } else {
             this.print("Zooming in. Going to:", nextZoom);
             let child = this._getQuadkeyForPoint(o["geom"]["p"][0], nextZoom);
-            outages = new Map(
+            outages = new Map([
               ...(await this._visit([ child ], old, nextZoom, true)),
               ...outages
-            );
+            ]);
           }
         } else {
           this.print("Looking for neighbors");
           let neighbors = this._getNeighboringQuadkeys(quadkeys[i]);
-          outages = new Map(
+          outages = new Map([
             ...(await this._visit(neighbors, old, zoom)),
             ...outages
-          );
+          ]);
 
           let outageInfo = this._getOutageInfo(o, url);
           outages.set(outageInfo.id, outageInfo);
@@ -184,9 +184,14 @@ class KubraScraper extends DeltaScraper {
   _getQuadkeyURL(quadkey) {
     let substitution = quadkey.substr(-3).split("").reverse().join("");
     let dataPath = this.clusterDataPath.replace("{qkh}", substitution);
-    return (
-      (`${this.baseURL + dataPath}/public/${this.layerName}/${quadkey}.json`)
-    );
+
+    return format(this.baseURL, dataPath, this.layerName, quadkey);
+
+    function format(baseURL, dataPath, layerName, quadkey) {
+      return (
+        baseURL + dataPath + "/public/" + layerName + "/" + quadkey + ".json"
+      );
+    }
   }
 
   _getQuadkeyForPoint(point, zoom) {
@@ -271,8 +276,16 @@ class KubraScraper extends DeltaScraper {
       custAffected: desc["cust_a"]["val"],
       crewStatus: desc["crew_status"],
       startTime: desc["start_time"],
-      latitude: loc[0][0].toFixed(5),
-      longitude: loc[0][1].toFixed(5),
+      /*
+       * Here, this should arguably(?) be implemented like:
+       *
+       *    latitude: Number.parseFloat(loc[0][0].toFixed(5)),
+       *    longitude: Number.parseFloat(loc[0][1].toFixed(5)),
+       *
+       * Needs verfication.
+       */
+      latitude: loc[0][0],
+      longitude: loc[0][1],
       source: url
     }
   }
