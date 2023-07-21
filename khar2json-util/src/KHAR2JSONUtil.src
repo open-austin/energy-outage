@@ -147,7 +147,7 @@ KHAR2JSONUtil.ReadResult = class ReadResult {
 
   asJSON() { // XXX needs audit/scrutiny
     if (this.ok && this.selection) {
-      return JSON.parse(this.selection); // XXX cache this
+      return JSON.parse(this.selection);
     }
     throw Error("response not valid JSON");
   }
