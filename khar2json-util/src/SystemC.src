@@ -62,6 +62,7 @@ class SystemC extends SystemA {
 
         var status = SystemC.EXIT_BADARGS;
       } else if (err instanceof NoSuchFileError) {
+        this._report(String(err));
         var status = SystemC.EXIT_BADFILE;
       } else {
         this._report("Unrecognized error:", err);

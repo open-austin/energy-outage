@@ -56,8 +56,6 @@ class KHAR2JSONUtil {
 
   // NB: This is a void method; main.src depends on it having no return value.
   async run(inputPath, defaultName = "output.json", scraper = this._scraper) {
-    const { NoSuchFileError } = this._system;
-
     const { $actuallyReadFileContents } = this;
 
     let contents = await $actuallyReadFileContents(inputPath);

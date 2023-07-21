@@ -88,6 +88,10 @@ SystemA.NoSuchFileError = class NoSuchFileError extends Error {
     super(message);
     this.path = path;
   }
+
+  toString() {
+    return this.message + ": " + this.path
+  }
 }
 
 SystemA.NoFileSourceError = class NoFileSourceError extends Error {
