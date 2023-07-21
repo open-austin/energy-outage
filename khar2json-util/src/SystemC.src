@@ -82,8 +82,8 @@ class SystemC extends SystemA {
   getProgramArguments() {
     const { ArgError } = SystemC;
 
-    if (this._args.length == 1) { // XXX
-      return this._args;
+    if (1 <= this._args.length && this._args.length <= 2) {
+      return [ ...this._args ];
     }
 
     throw new ArgError();
