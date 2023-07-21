@@ -72,7 +72,7 @@ class KHAR2JSONUtil {
 
     let listOfOutages = await scraper.fetchData();
 
-    if (!this.outputPath) {
+    if (!this._outputPath) {
       this._outputPath = defaultName;
     }
 
