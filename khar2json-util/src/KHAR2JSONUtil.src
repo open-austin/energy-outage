@@ -117,7 +117,11 @@ class KHAR2JSONUtil {
   }
 
   log(...args) {
-    console.log(...args); // XXX
+    if (typeof(console) != "undefined") {
+      console.log(...args);
+    } else { // this should be unreachable, but just for good measure...
+      throw new Error("Couldn't print feedback message!");
+    }
   }
 }
 
