@@ -2,7 +2,7 @@
  * This is a total hack.  It is designed to be deleted.  It implements a stub
  * method that's hardcoded to expect coordinates for a bounding box around
  * Austin.  It will return an appropriate tile for x=29, y=52 at the only
- * supported zoom- level (7).
+ * supported zoom-level (7).
  *
  * When will it be safe to delete this hack?  A: When `Mapping.tiles` has been
  * implemented for real.
