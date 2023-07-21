@@ -24,6 +24,8 @@
 // service that takes advantage of the same abstraction to allow the scraper
 // to work with live data coming over the wire via real network requests.)
 
+import { CoordinatePrecisionHack } from "../../CoordinatePrecisionHack.src";
+
 export
 class KHAR2JSONUtil {
   constructor(system, asyncReadFileHelper = null) {
@@ -74,10 +76,16 @@ class KHAR2JSONUtil {
       this._outputPath = defaultName;
     }
 
-    // TODO This should be pretty-printed.
     return await this._system.write(
-      this._outputPath, JSON.stringify(listOfOutages)
+      this._outputPath, this._prettyPrint(listOfOutages)
     );
+  }
+
+  // This is meant to control how the JSON is actually written.  Necessary
+  // because TC-39's `JSON.stringify` specification is deficient for dealing
+  // with floating point numbers (specifically on the matter of truncation).
+  _prettyPrint(data) {
+    return CoordinatePrecisionHack.formatJSON(data);
   }
 
   // By implementing this method, we conform to the interface expected by the
