@@ -12,9 +12,9 @@ void function main() {
   system.setUpForExec(KHAR2JSONUtil).then((converter) => {
     converter.delegateTo(AustinEnergyScraper);
 
-    let [ inputPath, ...opt ] = system.getProgramArguments();
-    let outputPath = (opt.length && opt[0]) || null;
-    if (outputPath) {
+    let [ inputPath, ...etc ] = system.getProgramArguments();
+    if (etc.length) {
+      let [ outputPath ] = etc;
       converter.setOutputFile(outputPath);
     }
 
