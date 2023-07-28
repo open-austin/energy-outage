@@ -24,12 +24,12 @@ class KubraScraper extends DeltaScraper {
     });
   }
 
-  // Reified scrapers must override this property:
+  // Reified crawlers must override this property:
   get instanceID() {
     throw Error("abstract KubraScraper has no Kubra instance ID");
   }
 
-  // Reified scrapers must override this property:
+  // Reified crawlers must override this property:
   get viewID() {
     throw Error("abstract KubraScraper has no Kubra view ID");
   }

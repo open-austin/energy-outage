@@ -10,7 +10,7 @@ void function main() {
   if (!system) throw SystemA.ShuntingError("Unknown environment");
 
   system.setUpForExec(KHAR2JSONUtil).then((converter) => {
-    converter.delegateTo(AustinEnergyScraper);
+    converter.delegateTo(AustinEnergyCrawler);
 
     let [ inputPath, ...etc ] = system.getProgramArguments();
     if (etc.length) {
@@ -26,4 +26,4 @@ void function main() {
   }
 } ();
 
-import { AustinEnergyScraper } from "../AustinEnergyScraper.src";
+import { AustinEnergyCrawler } from "../AustinEnergyCrawler.src";
