@@ -37,13 +37,15 @@
     have to be khar2json.app.htm, exactly, that gets loaded.  Any suitable
     AustinEnergyCrawler-based build will work.  It just happens that khar2json
     is the main target, and getting it built is already accounted for, making
-    it handy and reuse is straightforward. --></p>
+    it handy and reuse is straightforward. XXX actually, we're binding
+    directly to `KHAR2JSONUtil.ReadResult` by name, so we at least need that,
+    or something shapped like it. --></p>
 
-    <p>The purpose of this shell is to provide an appropriate implementation
-    of the <code>read</code> operation that permits the crawler to make live
-    requests for the outage map data over the network, rather than reading
-    files previously saved to disk (or from a HAR capture, as expected by
-    khar2json).</p>
+    <p>The purpose of this shell is to ultimately supply an appropriate
+    implementation of the expected <code>read</code> capability that permits
+    the crawler to make live requests for the outage map data over the
+    network, rather than reading files previously saved to disk (or from a HAR
+    capture, as expected by khar2json).</p>
 
     <p>By default, it is assumed that you have built khar2json and that it is
     accessible as <code>khar2json.app.htm</code> with respect to the same
@@ -77,26 +79,17 @@
           if (this._script) throw Error("Scripts must be standalone");
           this._script = this._doc.createElement("script");
           this._script.src = what;
-          this._script.addEventListener("load", this);
-          this._script.addEventListener("error", this);
+          this._script.addEventListener("error", this); // cf `handleEvent`
+          this._script.addEventListener("load", this); // cf `handleEvent`
           this._doc.head.append(this._script);
         }
 
         handleEvent(event) {
           switch (event.type) {
-            case "load": return void(this._onScriptLoaded(event));
             case "error": return void(this._onScriptFailedToLoad(event));
+            case "load": return void(this._onScriptLoaded(event));
           }
           throw new Error("wat.  Event type: " + event.type);
-        }
-
-        _onScriptLoaded(event, which = event.target) {
-          if (which == this._script) {
-            which.removeEventListener("load", this);
-
-            // SystemB attaches its own load listener.  Not needed.
-            this._doc.defaultView.onload = null;
-          }
         }
 
         _onScriptFailedToLoad(event, which = event.target) {
@@ -122,10 +115,62 @@
         _dispatch($handler, ...args) {
           if ($handler) $handler.call(null, ...args);
         }
+
+        _onScriptLoaded(event, which = event.target) {
+          if (which == this._script) {
+            which.removeEventListener("load", this);
+
+            // SystemB attaches its own load listener.  Not needed.
+            this._doc.defaultView.onload = null;
+
+            let system = new CrawlerCapabilities(this, );
+            system.setUpForExec(AustinEnergyCrawler).then((crawler) => {
+              crawler.fetchData();
+            });
+          }
+        }
       }
 
       OutageCollector.DEFAULT_SCRIPT_PATH = "khar2json.app.htm";
       OutageCollector.SUGGESTED_ALTERNATIVE_PATH = "out.app.htm";
+
+      /// import { CrawlerCapabilities } from "./CrawlerCapabilities.src"
+      /// import { HTMLHelper } from "./HTMLHelper.src"
+
+    </script>
+
+    <script>
+
+      class CrawlerCapabilities {
+        async setUpForExec($$Crawler) {
+          let app = new $$Crawler(this);
+          return app;
+        }
+
+        async read(url) {
+          if (typeof(KHAR2JSONUtil) == "undefined") throw Error(
+            "Not ready for reads"
+          );
+
+          const { ReadResult } = KHAR2JSONUtil;
+
+          let response = await fetch(url);
+          if (response.ok) {
+            let content = await response.text();
+            return new ReadResult(content);
+          }
+          // TODO provide feedback based on status
+          return new ReadResult(null);
+        }
+
+        log(...args) {
+          if (typeof(console) != "undefined") { // XXX temporary impl
+            console.log(...args);
+          } else { // should be unreachable
+            throw new Error("Couldn't print feedback message!");
+          }
+        }
+      }
 
     </script>
 
