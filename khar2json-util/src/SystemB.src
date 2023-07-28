@@ -80,12 +80,6 @@ class SystemB extends SystemA {
     return Promise.reject(new Error("Empty file name"));
   }
 
-  list(path) {
-    return Promise.resolve(
-      FileUtils.list(this._fileSource, path)
-    );
-  }
-
   // NB: internal use only (for UI; not part of the abstract system interface)
   requestFileSource() {
     this._directoryInput.click();
