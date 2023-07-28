@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <title>A data harvester for Austin Energy outages</title>
+    <!-- Author: Colby Russell -->
+    <!-- Related: https://colbyrussell.com/LP/debut/ -->
+  </head>
+  <body>
+    <div class="launcher app-panel">
+      <!-- TODO parse fragment on page load and give advisory about use. -->
+      <a href="#!" class="tentative button"
+         title="Load collector logic from script">
+        Launch&#8230;
+      </a>
+    </div>
+
+    <h1>Collecting Austin Energy outage data</h1>
+
+    <p>This is a client for the <a href="https://outagemap.austinenergy.com/"
+    >Austin Energy outage map</a>.  It relies on the khar2json utility and is
+    made available here as a self-documenting program.</p>
+
+    <p>You can think of the contents of this page as part of a computational
+    notebook.  It runs directly in the Web browser.  No affordances are
+    provided for in-browser editing, however; to make changes, open this file
+    in your text editor of choice.</p>
+
+    <div class="main-ui app-panel"></div>
+    <hr/>
+
+    <p>To start with we define a shell around the khar2json crawler's core
+    logic (which is actually provided by the <code>AustinEnergyCrawler</code>
+    and <code>KubraScraper</code> modules—we don't really want or need the
+    behavior that <code>KHAR2JSONUtil</code> specializes in, i.e., reading a
+    network capture in HAR format from disk).<!-- For that reason, it doesn't
+    have to be khar2json.app.htm, exactly, that gets loaded.  Any suitable
+    AustinEnergyCrawler-based build will work.  It just happens that khar2json
+    is the main target, and getting it built is already accounted for, making
+    it handy and reuse is straightforward. --></p>
+
+    <p>The purpose of this shell is to provide an appropriate implementation
+    of the <code>read</code> operation that permits the crawler to make live
+    requests for the outage map data over the network, rather than reading
+    files previously saved to disk (or from a HAR capture, as expected by
+    khar2json).</p>
+
+    <p>By default, it is assumed that you have built khar2json and that it is
+    accessible as <code>khar2json.app.htm</code> with respect to the same
+    directory as this RUNME.  Consult the <a href="README.markdown"
+    >README</a> for instructions on how to build khar2json.  (It's not
+    difficult; no additional software is needed—just a Web browser.)</p>
+
+    <script>
+
+      class OutageCollector {
+        constructor(document, $reset = null) {
+          this.onreset = $reset;
+
+          this.statics = OutageCollector.initializeHelpers();
+
+          this._script = null;
+
+          this._doc = document;
+        }
+
+        static initializeHelpers() {
+          let html = new HTMLHelper();
+
+          return {
+            escape: html.escapeText.bind(html),
+            html: html
+          }
+        }
+
+        load(what = OutageCollector.DEFAULT_SCRIPT_PATH) {
+          if (this._script) throw Error("Scripts must be standalone");
+          this._script = this._doc.createElement("script");
+          this._script.src = what;
+          this._script.addEventListener("load", this);
+          this._script.addEventListener("error", this);
+          this._doc.head.append(this._script);
+        }
+
+        handleEvent(event) {
+          switch (event.type) {
+            case "load": return void(this._onScriptLoaded(event));
+            case "error": return void(this._onScriptFailedToLoad(event));
+          }
+          throw new Error("wat.  Event type: " + event.type);
+        }
+
+        _onScriptLoaded(event, which = event.target) {
+          if (which == this._script) {
+            which.removeEventListener("load", this);
+
+            // SystemB attaches its own load listener.  Not needed.
+            this._doc.defaultView.onload = null;
+          }
+        }
+
+        _onScriptFailedToLoad(event, which = event.target) {
+          if (which == this._script) {
+            which.parentElement.removeChild(which);
+            this._script = null;
+
+            let { prompt } = this._doc.defaultView;
+            let path = prompt(
+              "Loading the resource " + JSON.stringify(which.src) + " " +
+              "failed.\n\nEnter the path to the khar2json utility:",
+              OutageCollector.SUGGESTED_ALTERNATIVE_PATH
+            );
+
+            if (path) {
+              this.load(path);
+            } else {
+              this._dispatch(this.onreset, which.src);
+            }
+          }
+        }
+
+        _dispatch($handler, ...args) {
+          if ($handler) $handler.call(null, ...args);
+        }
+      }
+
+      OutageCollector.DEFAULT_SCRIPT_PATH = "khar2json.app.htm";
+      OutageCollector.SUGGESTED_ALTERNATIVE_PATH = "out.app.htm";
+
+    </script>
+
+    <script>
+
+      class HTMLHelper {
+        constructor() {
+          this._escapesTable = new Map();
+          this._escapesTable.set("<", "&lt;");
+          this._escapesTable.set(">", "&gt;");
+          this._escapesTable.set("&", "&amp;");
+          this._escapesTable.set("'", "&#x27;");
+          this._escapesTable.set("\"", "&quot;");
+        }
+
+        escapeText(text) {
+          return String(text).replace(
+            /[<>&"']/g, ((x) => (this.escapeEntity(x)))
+          );
+        }
+
+        escapeEntity(character) {
+          return this._escapesTable.get(character) || (
+            (() => { throw new Error("Cannot escape: " + character) })()
+          );
+        }
+      }
+
+    </script>
+
+    <h2 id="entry-point">Entry point</h2>
+
+    <script>
+
+      void function _start() {
+        if (typeof(window) == "undefined") throw new Error("panic!"); // XXX
+        if (typeof(document) == "undefined") throw new Error("panic!"); // XXX
+
+        var app = null;
+        if (document.readyState != "complete") {
+          return void(window.onload = main);
+        }
+        return void(main(null, document));
+
+        function main(event, page = event.target) {
+          let app = new OutageCollector(page, $reset);
+          function $reset(pathOfLastResourceAttempted) {
+            launchButton.href = href;
+            launchButton.title = title;
+            listenForLaunchClick(launchButton, pathOfLastResourceAttempted);
+          }
+
+          let launchButton = page.querySelector("a[href='#!']");
+          let { title, href } = launchButton;
+
+          function listenForLaunchClick(launchButton, filePath = undefined) {
+            launchButton.addEventListener("click", {
+              handleEvent: function (event) {
+                event.preventDefault();
+                launchButton.removeAttribute("title");
+                launchButton.removeAttribute("href");
+                launchButton.removeEventListener("click", this);
+
+                /* XXX
+                let container = page.querySelector(".main-ui.app-panel");
+                */
+
+                app.load(filePath);
+              }
+            });
+          }
+
+          listenForLaunchClick(launchButton);
+
+          if (window.location.hash == "#!") {
+            launchButton.click();
+          } else {
+            launchButton.classList.remove("tentative");
+          }
+        }
+      } ()
+
+    </script>
+
+    <h2 id="appendix-a-app-styling">Appendix A: App styling</h2>
+
+    <p>These rules dictate how the app appears.  Nothing here concerns
+    anything that appears in the document before the Launch button is pressed.
+    These rules complement the rules in <a
+    href="#appendix-b-basic-styling">Appendix B</a>, which control the basic
+    styles concerning the way the main text of this document is presented, and
+    those in <a href="#appendix-c-launcher-button">Appendix C</a> which apply
+    to the launcher button itself.</p>
+
+    <style>
+
+      .main-ui.app-panel:not(:empty) {
+        background-color: #F8F8F8;
+        border: 1px solid #DEDEDE;
+        border-radius: 2px;
+        padding: 2em;
+        margin: 2em auto 4em;
+        min-height: 62.5vh;
+      }
+
+    </style>
+
+    <h2 id="appendix-b-basic-styling">Appendix B: Basic styling</h2>
+
+    <p>This is the style sheet that controls the presentation for the main
+    text of this document.  (The styling for the app itself is above, in <a
+    href="#appendix-a-app-styling">Appendix A</a>.)</p>
+
+    <style>
+
+      body {
+        background-color: #EEE;
+        margin: 4em auto;
+        padding: 0 2em;
+        max-width: 99ch;
+      }
+
+      body script,
+      body style {
+        display: block;
+        margin: 2em 0;
+        padding: 1em 0;
+        border-radius: 0.25em;
+        background-color: #DDD;
+        font-family: monospace;
+        white-space: pre;
+      }
+
+      body script::before,
+      body script::after,
+      body style::before,
+      body style::after {
+        font-family: monospace;
+        color: #888;
+        display: block;
+        margin-left: 1em;
+      }
+
+      body script::before {
+        margin-bottom: -1em;
+        content: '\3Cscript\3E\0A';
+      }
+
+      body script::after {
+        margin-top: -2em;
+        content: '\0A\3C/script\3E';
+      }
+
+      body style::before {
+        margin-bottom: -1em;
+        content: '\3Cstyle\3E\0A';
+      }
+
+      body style::after {
+        margin-top: -2em;
+        content: '\0A\3C/style\3E';
+      }
+
+    </style>
+
+    <h2 id="appendix-c-launcher-button">Appendix C: The launcher button</h2>
+
+    <style>
+
+      .launcher.app-panel {
+        margin-top: 0.5em;
+        float: right;
+      }
+
+      .launcher.app-panel a.button {
+        color: #EEE;
+        background-color: #333;
+        background-image: linear-gradient(#444, #222);
+        background-repeat: repeat-x;
+
+        padding: 0.5em 1em;
+        border: 2px solid #DDD;
+        border-radius: 8px;
+        cursor: pointer;
+
+        font-weight: bold;
+        text-decoration: none;
+        font-family: sans;
+      }
+
+      /*
+       * disabled - a.button:not([href])
+       * enabled - a.button[href]
+       */
+
+      .launcher.app-panel a.button[href]:hover {
+        background-image: unset;
+        border-color: #CCC;
+      }
+
+      .launcher.app-panel a.button.tentative,
+      .launcher.app-panel a.button:not([href]) {
+        background-image: unset;
+        background-color: #C8CCD4;
+        border-color: #E4E8EA;
+        color: #E4E8EA;
+        cursor: default;
+        transition: background-color 0.12s, color 0.12s;
+      }
+
+    </style>
+  </body>
+</html>
