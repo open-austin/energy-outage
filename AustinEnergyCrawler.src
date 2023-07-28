@@ -1,10 +1,10 @@
 import { KubraScraper } from "./KubraScraper.src"
 
 export
-class AustinEnergyScraper extends KubraScraper {
+class AustinEnergyCrawler extends KubraScraper {
 
   // The `instanceID` and `viewID` are quasi-immutable; `KubraScraper` defines
-  // them as accessors so it can throw if a scraper is not instantiated as a
+  // them as accessors so it can throw if a crawler is not instantiated as a
   // more specialized class (like this one), and it's easier to just override
   // the getters than it is to mess with property descriptors...
 

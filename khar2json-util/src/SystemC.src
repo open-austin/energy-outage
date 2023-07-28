@@ -97,12 +97,6 @@ class SystemC extends SystemA {
     });
   }
 
-  list(path) {
-    return this._files.list(path).catch((err) => {
-      return this._wrapFSError(err, path);
-    });
-  }
-
   _wrapFSError(nodeError, path) {
     const { NoSuchFileError } = SystemA;
     switch (nodeError.code) {
